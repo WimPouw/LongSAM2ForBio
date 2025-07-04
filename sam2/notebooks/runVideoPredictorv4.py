@@ -543,23 +543,29 @@ class VideoChunkProcessor:
                     results[gap_frame][obj_id] = interpolated_mask
 
     def create_analysis_video(self, results, output_path, fps=30, alpha=0.5):
-        """Create analysis video with plots and metrics - FIXED"""
+        """
+        Create analysis video with masked overlay and connected time series plots
+        
+        Args:
+            results: Dictionary of results from process_video
+            output_path: Where to save the analysis video
+            fps: Frames per second for output video
+            alpha: Opacity of mask overlay (0 to 1)
+        """
+        import matplotlib.pyplot as plt
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        
         if not results:
             print("No results to analyze!")
             return
         
-        print("Creating analysis video...")
-        
-        # Get color map and object names
+        # Get color map
         cmap = plt.get_cmap("tab10")
         object_names = getattr(self, 'object_names', {})
         
-        # Debug info
-        print(f"Object names available: {object_names}")
-        print(f"Results frames: {len(results)}")
-        print(f"Objects found: {set(obj_id for frame in results.values() for obj_id in frame.keys())}")
-        
         # Collect time series data
+        print("Collecting time series data...")
         time_series_data = {}
         max_frame_idx = max(results.keys())
         
@@ -568,8 +574,7 @@ class VideoChunkProcessor:
                 'frames': [],
                 'centroids': [],
                 'areas': [],
-                'colors_rgb': [],
-                'plot_color': cmap(obj_id % 10)[:3]
+                'plot_color': cmap(obj_id % 10)[:3]  # Store plot color to match mask
             }
         
         # Calculate metrics for all frames
@@ -586,11 +591,9 @@ class VideoChunkProcessor:
                 data['frames'].append(frame_idx)
                 data['centroids'].append((metrics['seg_centroid_x'], metrics['seg_centroid_y']))
                 data['areas'].append(metrics['surface_area'])
-                data['colors_rgb'].append([metrics['mean_color_r'], 
-                                         metrics['mean_color_g'], 
-                                         metrics['mean_color_b']])
         
-        # Calculate derived metrics
+        # Calculate derived metrics (simplified - just movement and area)
+        print("Calculating derived metrics...")
         window_size = 10
         for obj_id in time_series_data:
             data = time_series_data[obj_id]
@@ -606,41 +609,30 @@ class VideoChunkProcessor:
             else:
                 data['movement'] = np.array([0])
             
-            colors = np.array(data['colors_rgb'])
-            if len(colors) > 1:
-                data['color_change'] = np.linalg.norm(np.diff(colors, axis=0), axis=1)
-                data['color_change'] = np.insert(data['color_change'], 0, 0)
-            else:
-                data['color_change'] = np.array([0])
-            
             # Calculate moving averages
             data['area_ma'] = np.convolve(data['areas'], 
-                                         np.ones(window_size)/window_size, 
-                                         mode='same')
+                                        np.ones(window_size)/window_size, 
+                                        mode='same')
             data['movement_ma'] = np.convolve(data['movement'],
-                                             np.ones(window_size)/window_size,
-                                             mode='same')
-            data['color_ma'] = np.convolve(data['color_change'],
-                                          np.ones(window_size)/window_size,
-                                          mode='same')
+                                            np.ones(window_size)/window_size,
+                                            mode='same')
         
         # Video setup
         first_frame = cv2.imread(os.path.join(self.video_dir, self.frame_names[0]))
         height, width = first_frame.shape[:2]
         
-        # Layout calculation
+        # Layout calculation - SIMPLIFIED (no bottom plots)
         n_objects = len([obj_id for obj_id in time_series_data if time_series_data[obj_id]['frames']])
         if n_objects == 0:
             print("No valid objects for analysis video")
             return
         
-        side_plot_height = height // max(n_objects, 1)
-        side_plot_width = width // 3
-        bottom_plot_height = height // 4
+        side_plot_height = height // max(n_objects, 1)  # Each side plot gets equal height
+        side_plot_width = width // 3                   # Side plots are 1/3 width
         
-        # Total output dimensions
-        out_width = width + (2 * side_plot_width)
-        out_height = height + bottom_plot_height
+        # Total output dimensions - SIMPLIFIED (no bottom section)
+        out_width = width + (2 * side_plot_width)  # Main video + left & right plots
+        out_height = height                        # Just the main video height
         
         # Video position in output frame
         video_x = side_plot_width
@@ -649,6 +641,7 @@ class VideoChunkProcessor:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(output_path, fourcc, fps, (out_width, out_height))
         
+        print("\nCreating analysis video with connection lines...")
         for frame_idx in tqdm(range(len(self.frame_names)), desc="Creating analysis video"):
             # Create output canvas
             output_frame = np.zeros((out_height, out_width, 3), dtype=np.uint8)
@@ -690,7 +683,7 @@ class VideoChunkProcessor:
             # Place video in center
             output_frame[video_y:video_y+height, video_x:video_x+width] = overlay
             
-            # Create and place plots for each object
+            # Create and place plots for each object with CONNECTION LINES
             plot_idx = 0
             for obj_id, data in time_series_data.items():
                 if not data['frames']:  # Skip empty data
@@ -702,11 +695,10 @@ class VideoChunkProcessor:
                 # Get object name
                 obj_name = object_names.get(obj_id, f"Object_{obj_id}")
                 
-                # Left plot (Movement) - with error handling
+                y_offset = plot_idx * side_plot_height
+                
+                # LEFT PLOT: Movement with CONNECTION LINE
                 try:
-                    if not data['frames']:  # Skip if no data
-                        continue
-                        
                     fig_left = Figure(figsize=(side_plot_width/100, side_plot_height/100), dpi=100)
                     ax_left = fig_left.add_subplot(111)
                     
@@ -725,45 +717,97 @@ class VideoChunkProcessor:
                     plot_img = np.frombuffer(canvas.tostring_rgb(), dtype=np.uint8)
                     plot_img = plot_img.reshape(canvas.get_width_height()[::-1] + (3,))
                     
-                    y_offset = plot_idx * side_plot_height
                     if y_offset + side_plot_height <= out_height:
                         plot_height = min(side_plot_height, plot_img.shape[0])
                         plot_width = min(side_plot_width, plot_img.shape[1])
                         output_frame[y_offset:y_offset+plot_height, :plot_width] = plot_img[:plot_height, :plot_width]
                     
+                    # Draw connection line from left plot to mask centroid
+                    if obj_id in centroids and frame_idx < len(data['frames']) and data['frames']:
+                        # Find current frame in data
+                        current_data_idx = None
+                        for i, f in enumerate(data['frames']):
+                            if f <= frame_idx:
+                                current_data_idx = i
+                        
+                        if current_data_idx is not None:
+                            value = data['movement_ma'][current_data_idx]
+                            
+                            # Convert value to y-coordinate in plot space
+                            y_range = ax_left.get_ylim()
+                            if y_range[1] > y_range[0]:  # Valid range
+                                plot_height_actual = side_plot_height
+                                y_plot = plot_height_actual - ((value - y_range[0]) / (y_range[1] - y_range[0]) * plot_height_actual)
+                                y_plot = max(0, min(plot_height_actual, int(y_offset + y_plot)))
+                                
+                                # Draw connection from current point to mask centroid
+                                start_point = (side_plot_width-2, y_plot)
+                                end_point = centroids[obj_id]
+                                cv2.line(output_frame, start_point, end_point, color_rgb, 2, cv2.LINE_AA)
+                                
+                                # Add a small circle at the start point
+                                cv2.circle(output_frame, start_point, 3, color_rgb, -1)
+                    
                     plt.close(fig_left)
                     
                 except Exception as e:
                     print(f"Error creating movement plot for object {obj_id}: {e}")
-                    
-                # Right plot (Area) - with error handling  
+                
+                # RIGHT PLOT: Area with CONNECTION LINE
                 try:
+                    fig_right = Figure(figsize=(side_plot_width/100, side_plot_height/100), dpi=100)
+                    ax_right = fig_right.add_subplot(111)
+                    
                     if len(data['areas']) > 0 and len(data['frames']) > 0:
-                        fig_right = Figure(figsize=(side_plot_width/100, side_plot_height/100), dpi=100)
-                        ax_right = fig_right.add_subplot(111)
                         ax_right.plot(data['frames'], data['areas'], color=plot_color, alpha=0.5)
                         ax_right.plot(data['frames'], data['area_ma'], color=plot_color, linewidth=2)
                         ax_right.set_xlim(0, max_frame_idx)
                         ax_right.axvline(frame_idx, color='k', linestyle='--', alpha=0.5)
                         ax_right.set_title(f'Area ({obj_name})', fontsize=8)
                         ax_right.tick_params(labelsize=6)
-                        fig_right.tight_layout()
+                    
+                    fig_right.tight_layout()
+                    
+                    canvas = FigureCanvasAgg(fig_right)
+                    canvas.draw()
+                    plot_img = np.frombuffer(canvas.tostring_rgb(), dtype=np.uint8)
+                    plot_img = plot_img.reshape(canvas.get_width_height()[::-1] + (3,))
+                    
+                    x_offset = video_x + width
+                    if y_offset + side_plot_height <= out_height and x_offset + side_plot_width <= out_width:
+                        plot_height = min(side_plot_height, plot_img.shape[0])
+                        plot_width = min(side_plot_width, plot_img.shape[1])
+                        output_frame[y_offset:y_offset+plot_height, 
+                                    x_offset:x_offset+plot_width] = plot_img[:plot_height, :plot_width]
+                    
+                    # Draw connection line from right plot to mask centroid
+                    if obj_id in centroids and frame_idx < len(data['frames']) and data['frames']:
+                        # Find current frame in data
+                        current_data_idx = None
+                        for i, f in enumerate(data['frames']):
+                            if f <= frame_idx:
+                                current_data_idx = i
                         
-                        canvas = FigureCanvasAgg(fig_right)
-                        canvas.draw()
-                        plot_img = np.frombuffer(canvas.tostring_rgb(), dtype=np.uint8)
-                        plot_img = plot_img.reshape(canvas.get_width_height()[::-1] + (3,))
-                        
-                        y_offset = plot_idx * side_plot_height
-                        x_offset = video_x + width
-                        if y_offset + side_plot_height <= out_height and x_offset + side_plot_width <= out_width:
-                            plot_height = min(side_plot_height, plot_img.shape[0])
-                            plot_width = min(side_plot_width, plot_img.shape[1])
-                            output_frame[y_offset:y_offset+plot_height, 
-                                        x_offset:x_offset+plot_width] = plot_img[:plot_height, :plot_width]
-                        
-                        plt.close(fig_right)
-                        
+                        if current_data_idx is not None:
+                            value = data['area_ma'][current_data_idx]
+                            
+                            # Convert value to y-coordinate in plot space
+                            y_range = ax_right.get_ylim()
+                            if y_range[1] > y_range[0]:  # Valid range
+                                plot_height_actual = side_plot_height
+                                y_plot = plot_height_actual - ((value - y_range[0]) / (y_range[1] - y_range[0]) * plot_height_actual)
+                                y_plot = max(0, min(plot_height_actual, int(y_offset + y_plot)))
+                                
+                                # Draw connection from current point to mask centroid
+                                start_point = (x_offset + 2, y_plot)
+                                end_point = centroids[obj_id]
+                                cv2.line(output_frame, start_point, end_point, color_rgb, 2, cv2.LINE_AA)
+                                
+                                # Add a small circle at the start point
+                                cv2.circle(output_frame, start_point, 3, color_rgb, -1)
+                    
+                    plt.close(fig_right)
+                    
                 except Exception as e:
                     print(f"Error creating area plot for object {obj_id}: {e}")
                 
@@ -772,8 +816,8 @@ class VideoChunkProcessor:
             out.write(output_frame)
         
         out.release()
-        print(f"Analysis video saved to: {output_path}")
-        
+        print(f"Analysis video with connection lines saved to: {output_path}")
+
     def create_simple_analysis_video(self, results, output_path, fps=30, alpha=0.5):
         """Create a simple analysis video without complex plots as fallback"""
         if not results:
@@ -1884,13 +1928,57 @@ class FineTunedInferenceProcessor:
             
             # Initialize model architecture
             if model_type == 'deeplabv3_resnet50':
-                self.trained_model = deeplabv3_resnet50(pretrained=False, num_classes=21)
-                # Modify for our classes
-                self.trained_model.classifier[4] = nn.Conv2d(256, num_classes, kernel_size=1)
-                self.trained_model.aux_classifier[4] = nn.Conv2d(256, num_classes, kernel_size=1)
+                # Initialize with the same structure as training
+                try:
+                    # Try to use the modern weights enum (same as training)
+                    from torchvision.models.segmentation import DeepLabV3_ResNet50_Weights
+                    self.trained_model = deeplabv3_resnet50(weights=DeepLabV3_ResNet50_Weights.COCO_WITH_VOC_LABELS_V1, num_classes=21)
+                except ImportError:
+                    # Fallback for older torchvision versions
+                    self.trained_model = deeplabv3_resnet50(pretrained=True, num_classes=21)
+                
+                print("Base model loaded, modifying classifier...")
+                
+                # Debug: Check model structure before modification
+                print(f"Classifier structure: {type(self.trained_model.classifier)}")
+                print(f"Classifier length: {len(self.trained_model.classifier)}")
+                print(f"Aux classifier structure: {type(self.trained_model.aux_classifier)}")
+                print(f"Aux classifier length: {len(self.trained_model.aux_classifier)}")
+                
+                # Safely modify classifier for our classes
+                if hasattr(self.trained_model, 'classifier') and len(self.trained_model.classifier) > 4:
+                    if self.trained_model.classifier[4] is not None:
+                        self.trained_model.classifier[4] = nn.Conv2d(256, num_classes, kernel_size=1)
+                        print("✅ Modified main classifier")
+                    else:
+                        print("⚠️ Classifier[4] is None, creating new classifier")
+                        # Create a new classifier layer
+                        in_channels = 256  # Standard for DeepLabV3+
+                        self.trained_model.classifier[4] = nn.Conv2d(in_channels, num_classes, kernel_size=1)
+                else:
+                    print("⚠️ Unexpected classifier structure")
+                
+                if hasattr(self.trained_model, 'aux_classifier') and len(self.trained_model.aux_classifier) > 4:
+                    if self.trained_model.aux_classifier[4] is not None:
+                        self.trained_model.aux_classifier[4] = nn.Conv2d(256, num_classes, kernel_size=1)
+                        print("✅ Modified aux classifier")
+                    else:
+                        print("⚠️ Aux classifier[4] is None, creating new aux classifier")
+                        # Create a new aux classifier layer
+                        in_channels = 256  # Standard for DeepLabV3+
+                        self.trained_model.aux_classifier[4] = nn.Conv2d(in_channels, num_classes, kernel_size=1)
+                else:
+                    print("⚠️ Unexpected aux classifier structure")
                 
                 # Load trained weights
-                self.trained_model.load_state_dict(checkpoint['model_state_dict'])
+                print("Loading trained weights...")
+                try:
+                    self.trained_model.load_state_dict(checkpoint['model_state_dict'])
+                    print("✅ Trained weights loaded successfully")
+                except Exception as e:
+                    print(f"⚠️ Error loading trained weights: {e}")
+                    print("Will use base model weights")
+                
                 self.trained_model = self.trained_model.to(self.device)
                 self.trained_model.eval()
                 
@@ -1900,12 +1988,14 @@ class FineTunedInferenceProcessor:
                 
         except Exception as e:
             print(f"Warning: Could not load trained model: {e}")
+            import traceback
+            traceback.print_exc()
             print("Will use base SAM2 for inference")
             self.trained_model = None
             # Fallback object names
             self.trained_objects = ['Custom_Object']
     
-    def auto_detect_objects(self, frame, confidence_threshold=0.3):
+    def auto_detect_objects(self, frame, confidence_threshold=0.1):  # Lowered threshold
         """Auto-detect trained objects using the fine-tuned model"""
         if self.trained_model is None:
             print("⚠️ No trained model available, using manual annotation")
@@ -1917,6 +2007,7 @@ class FineTunedInferenceProcessor:
         
         print("🤖 Auto-detection with fine-tuned DeepLabV3+ model...")
         print(f"Looking for trained objects: {self.trained_objects}")
+        print(f"Confidence threshold: {confidence_threshold}")
         
         try:
             # Prepare input with transforms
@@ -1931,11 +2022,26 @@ class FineTunedInferenceProcessor:
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             input_tensor = transform(frame_rgb).unsqueeze(0).to(self.device)
             
+            print(f"Input tensor shape: {input_tensor.shape}")
+            
             # Run inference
             with torch.no_grad():
                 output = self.trained_model(input_tensor)['out']
                 prediction = torch.softmax(output, dim=1)
                 pred_mask = torch.argmax(prediction, dim=1).squeeze().cpu().numpy()
+            
+            print(f"Output shape: {output.shape}")
+            print(f"Prediction shape: {prediction.shape}")
+            print(f"Pred mask shape: {pred_mask.shape}")
+            
+            # Analyze prediction statistics
+            unique_classes = np.unique(pred_mask)
+            print(f"Predicted classes: {unique_classes}")
+            
+            for cls in unique_classes:
+                pixels = np.sum(pred_mask == cls)
+                max_conf = float(torch.max(prediction[0, cls]).cpu().numpy())
+                print(f"  Class {cls}: {pixels} pixels, max confidence: {max_conf:.4f}")
             
             # Resize prediction back to original frame size
             height, width = frame.shape[:2]
@@ -1945,20 +2051,42 @@ class FineTunedInferenceProcessor:
                 interpolation=cv2.INTER_NEAREST
             ).astype(np.uint8)
             
-            # Extract object masks
+            print(f"Resized mask shape: {pred_mask_resized.shape}")
+            print(f"Original frame shape: {frame.shape}")
+            
+            # Extract object masks with more lenient criteria
             detected_objects = {}
             
             for class_id in range(1, len(self.trained_objects) + 1):  # Skip background (0)
                 class_mask = (pred_mask_resized == class_id)
+                area = np.sum(class_mask)
                 
-                if np.sum(class_mask) > 100:  # Minimum area threshold
-                    # Calculate confidence as fraction of max probability
-                    class_confidence = float(torch.max(prediction[0, class_id]).cpu().numpy())
+                print(f"Class {class_id} area: {area} pixels")
+                
+                if area > 50:  # Lowered minimum area threshold
+                    # Calculate confidence as average of predicted probabilities for this class
+                    class_conf_map = prediction[0, class_id].cpu().numpy()
+                    class_conf_resized = cv2.resize(class_conf_map, (width, height))
+                    avg_confidence = float(np.mean(class_conf_resized[class_mask]))
+                    max_confidence = float(np.max(class_conf_resized[class_mask]))
                     
-                    if class_confidence > confidence_threshold:
+                    print(f"Class {class_id} - Avg conf: {avg_confidence:.4f}, Max conf: {max_confidence:.4f}")
+                    
+                    if max_confidence > confidence_threshold:
                         detected_objects[class_id] = class_mask.astype(bool)
                         obj_name = self.trained_objects[class_id - 1] if class_id - 1 < len(self.trained_objects) else f"Object_{class_id}"
-                        print(f"✅ Detected {obj_name} (confidence: {class_confidence:.3f})")
+                        print(f"✅ Detected {obj_name} (area: {area}, max conf: {max_confidence:.3f})")
+                    else:
+                        obj_name = self.trained_objects[class_id - 1] if class_id - 1 < len(self.trained_objects) else f"Object_{class_id}"
+                        print(f"❌ {obj_name} below confidence threshold (max conf: {max_confidence:.3f})")
+                else:
+                    obj_name = self.trained_objects[class_id - 1] if class_id - 1 < len(self.trained_objects) else f"Object_{class_id}"
+                    print(f"❌ {obj_name} area too small ({area} pixels)")
+            
+            # If no objects detected, try with even lower threshold
+            if not detected_objects:
+                print(f"\n🔍 No objects found with threshold {confidence_threshold}, trying with 0.05...")
+                return self.auto_detect_objects(frame, confidence_threshold=0.05)
             
             return detected_objects
             
@@ -1967,6 +2095,51 @@ class FineTunedInferenceProcessor:
             import traceback
             traceback.print_exc()
             return {}
+    
+    def visualize_detection_debug(self, frame, detected_objects, save_path=None):
+        """Create a debug visualization of the detection results"""
+        try:
+            if not detected_objects:
+                print("No objects detected to visualize")
+                return
+            
+            # Create visualization
+            vis_frame = frame.copy()
+            
+            for obj_id, mask in detected_objects.items():
+                # Generate random color for each object
+                color = np.random.randint(0, 255, 3).tolist()
+                
+                # Apply colored mask
+                colored_mask = np.zeros_like(vis_frame)
+                colored_mask[mask] = color
+                
+                # Blend with original image
+                vis_frame = cv2.addWeighted(vis_frame, 0.7, colored_mask, 0.3, 0)
+                
+                # Add label
+                obj_name = self.trained_objects[obj_id - 1] if obj_id - 1 < len(self.trained_objects) else f"Object_{obj_id}"
+                
+                # Find center of mask for label placement
+                moments = cv2.moments(mask.astype(np.uint8))
+                if moments['m00'] != 0:
+                    cx = int(moments['m10'] / moments['m00'])
+                    cy = int(moments['m01'] / moments['m00'])
+                    
+                    cv2.putText(vis_frame, obj_name, (cx-50, cy), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            
+            # Save or display
+            if save_path:
+                cv2.imwrite(save_path, vis_frame)
+                print(f"Debug visualization saved: {save_path}")
+            else:
+                cv2.imshow('Detection Debug', vis_frame)
+                cv2.waitKey(2000)  # Show for 2 seconds
+                cv2.destroyWindow('Detection Debug')
+                
+        except Exception as e:
+            print(f"Error creating debug visualization: {e}")
     
     def get_trained_objects(self):
         """Get list of objects this model was trained on"""
@@ -2436,8 +2609,15 @@ class VideoAnalysisApp:
                 detection_frame_path = os.path.join(frames_dir, f"{detection_frame_idx:05d}.jpg")
                 detection_frame = cv2.imread(detection_frame_path)
                 
-                # Run auto-detection
+                print(f"Using frame {detection_frame_idx} for detection")
+                print(f"Frame shape: {detection_frame.shape}")
+                
+                # Run auto-detection with debugging
                 detected_objects = inference_processor.auto_detect_objects(detection_frame)
+                
+                # Create debug visualization
+                debug_vis_path = os.path.join(frames_dir, "detection_debug.jpg")
+                inference_processor.visualize_detection_debug(detection_frame, detected_objects, debug_vis_path)
                 
                 if detected_objects:
                     print(f"🎯 Auto-detected {len(detected_objects)} objects")
@@ -2446,6 +2626,19 @@ class VideoAnalysisApp:
                     points_dict, labels_dict, object_names = inference_processor.create_sam_prompts_from_detection(detected_objects)
                     
                     if points_dict:
+                        # Show success message with detection info
+                        detection_info = "\n".join([f"  • {name} (ID: {obj_id})" for obj_id, name in object_names.items()])
+                        result = messagebox.askyesno("Auto-detection Success!", 
+                            f"🎉 Successfully detected objects!\n\n"
+                            f"Detection Frame: {detection_frame_idx}\n"
+                            f"Objects Found:\n{detection_info}\n\n"
+                            f"📁 Debug visualization saved: detection_debug.jpg\n\n"
+                            f"Continue with tracking these objects?")
+                        
+                        if not result:
+                            self.status_var.set("Auto-detection cancelled by user")
+                            return
+                        
                         # Process video with detected objects using SAM2 for tracking
                         chunk_size = int(self.chunk_size_var.get())
                         processor = VideoChunkProcessor(
@@ -2490,6 +2683,7 @@ Auto-detected Objects: {len(detected_objects)}
 
 📁 Generated Files:
 • auto_inference_output.mp4 - Video with overlays
+• detection_debug.jpg - Debug visualization
 • segmentation_coco.json - Object annotations  
 • time_series_metrics.csv - Movement data
 
@@ -2504,16 +2698,57 @@ Auto-detected Objects: {len(detected_objects)}
                     else:
                         messagebox.showwarning("Warning", "Could not convert detections to tracking prompts")
                 else:
-                    messagebox.showinfo("Auto-detection Result", 
-                        "🤖 No objects were automatically detected.\n\n"
-                        "This could be because:\n"
-                        "• Objects are not clearly visible in the detection frame\n"
-                        "• Confidence threshold is too high\n"
-                        "• Objects are different from training data\n\n"
-                        "💡 Switching to manual mode for object selection.")
+                    # Show detailed debug info for failed detection
+                    debug_msg = f"""🤖 No objects were automatically detected.
+
+Debug Information:
+• Detection frame: {detection_frame_idx}
+• Frame shape: {detection_frame.shape}
+• Trained objects: {', '.join(inference_processor.get_trained_objects())}
+• Debug visualization: detection_debug.jpg
+
+Possible reasons:
+• Objects not clearly visible in detection frame {detection_frame_idx}
+• Model needs more training data
+• Different lighting/angle than training data
+• Objects are smaller/larger than in training
+
+💡 Solutions:
+1. Try a different detection frame
+2. Switch to manual mode
+3. Retrain with more diverse data"""
+                    
+                    messagebox.showinfo("Auto-detection Debug Info", debug_msg)
                 
-                # If auto-detection failed, fall back to manual mode
-                auto_mode = False
+                # Ask if user wants to try different frame or switch to manual
+                retry_choice = messagebox.askyesnocancel("Detection Options", 
+                    "Auto-detection didn't find objects.\n\n"
+                    "YES: Try different detection frame\n"
+                    "NO: Switch to manual mode\n"
+                    "CANCEL: Exit inference")
+                
+                if retry_choice is True:
+                    # Let user choose different frame
+                    new_frame = self.get_frame_number_with_preview(frames_dir, len(frame_files))
+                    if new_frame is not None:
+                        detection_frame_path = os.path.join(frames_dir, f"{new_frame:05d}.jpg")
+                        detection_frame = cv2.imread(detection_frame_path)
+                        print(f"Retrying detection with frame {new_frame}")
+                        
+                        # Retry detection
+                        detected_objects = inference_processor.auto_detect_objects(detection_frame)
+                        if detected_objects:
+                            # Process as above...
+                            print("Retry successful!")
+                            # (Could refactor this into a function to avoid code duplication)
+                
+                if retry_choice is False:
+                    # Fall back to manual mode
+                    auto_mode = False
+                else:
+                    # User cancelled
+                    self.status_var.set("Inference cancelled")
+                    return
             
             if not auto_mode:
                 # Manual mode - select objects on reference frame
