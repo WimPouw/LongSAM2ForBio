@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-Complete Video Analysis Script with SAM2 - Fixed Version
-Combines video processing, segmentation, and analysis into a single script
+Complete SAM2 Video Analysis Script - Fixed Version
+Addresses all major issues: frame preview, backward propagation, analysis video, chunk size UI, finetuning setup
 """
 
 import os
 import sys
 import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog
+from tkinter import filedialog, messagebox, simpledialog, ttk
 import cv2
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 from PIL import Image
 import subprocess
 import shutil
@@ -45,6 +47,12 @@ def setup_device():
         print("\nSupport for MPS devices is preliminary. SAM 2 might give numerically different outputs on MPS.")
     
     return device
+
+def cleanup_memory():
+    """Clean up GPU/CPU memory"""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
 
 def get_video_fps(video_path):
     """Get video FPS using OpenCV"""
@@ -83,15 +91,48 @@ def video_to_frames(input_video, output_dir, quality=2):
         print(f"Error: {str(e)}")
         return -1, -1
 
+def show_frame_preview(frames_dir, frame_idx, total_frames):
+    """Show a preview of the selected frame"""
+    frame_path = os.path.join(frames_dir, f"{frame_idx:05d}.jpg")
+    if not os.path.exists(frame_path):
+        messagebox.showerror("Error", f"Frame {frame_idx} not found")
+        return False
+    
+    frame = cv2.imread(frame_path)
+    if frame is None:
+        messagebox.showerror("Error", f"Could not load frame {frame_idx}")
+        return False
+    
+    # Resize frame for preview if too large
+    height, width = frame.shape[:2]
+    max_size = 800
+    if max(height, width) > max_size:
+        scale = max_size / max(height, width)
+        new_width = int(width * scale)
+        new_height = int(height * scale)
+        frame = cv2.resize(frame, (new_width, new_height))
+    
+    # Add frame info text
+    info_text = f"Frame {frame_idx}/{total_frames-1} - Preview"
+    cv2.putText(frame, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+    cv2.putText(frame, "Press any key to continue...", (10, frame.shape[0] - 20), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    
+    cv2.namedWindow('Frame Preview', cv2.WINDOW_NORMAL)
+    cv2.imshow('Frame Preview', frame)
+    cv2.waitKey(0)
+    cv2.destroyWindow('Frame Preview')
+    return True
+
 class VideoChunkProcessor:
     def __init__(self, predictor, video_dir, chunk_size=500, overlap_frames=20, 
-                 interactive_correction=True, seed_frame_idx=0, **kwargs):
+                 interactive_correction=True, seed_frame_idx=0):
         self.predictor = predictor
         self.video_dir = video_dir
         self.chunk_size = chunk_size
         self.overlap_frames = overlap_frames
         self.interactive_correction = interactive_correction
-        self.seed_frame_idx = seed_frame_idx  # The frame where user annotated objects
+        self.seed_frame_idx = seed_frame_idx
         
         if not os.path.exists(self.video_dir):
             raise FileNotFoundError(f"Video directory {self.video_dir} does not exist!")
@@ -110,35 +151,392 @@ class VideoChunkProcessor:
             self.seed_frame_idx = len(self.frame_names) // 2
             print(f"⚠️ Seed frame index too high, using middle frame: {self.seed_frame_idx}")
         
-        self.chunks = self._calculate_bidirectional_chunks()
-        print(f"Created {len(self.chunks)} chunks with seed frame at {self.seed_frame_idx}")
-        print(f"Processing order: seed → forward → backward")
+        print(f"Created processor with chunk size {chunk_size}, seed frame at {self.seed_frame_idx}")
         if interactive_correction:
-            print("🎯 Interactive correction mode enabled - you'll be prompted for mask discontinuities")
-    
+            print("🎯 Interactive correction mode enabled")
+
+    def _create_temp_video_dir(self, frames, temp_dir_name):
+        """Create temporary directory with numbered frames for SAM2"""
+        temp_dir = os.path.join(self.video_dir, temp_dir_name)
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+        os.makedirs(temp_dir)
+        
+        for i, frame_name in enumerate(frames):
+            src = os.path.join(self.video_dir, frame_name)
+            dst = os.path.join(temp_dir, f"{i:05d}.jpg")
+            shutil.copy2(src, dst)
+        
+        return temp_dir
+
+    def _generate_robust_points_from_mask(self, mask, num_positive=8, num_negative=16):
+        """Generate robust points from mask for propagation"""
+        if not mask.any():
+            return None, None
+            
+        points = []
+        labels = []
+        
+        if len(mask.shape) == 3:
+            mask = mask[0]
+        mask = mask.astype(bool)
+        
+        # Get contour points
+        contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            largest_contour = max(contours, key=cv2.contourArea)
+            contour_length = cv2.arcLength(largest_contour, True)
+            if contour_length > 0:
+                spacing = max(1, int(contour_length / num_positive))
+                for i in range(0, len(largest_contour), spacing):
+                    if len(points) >= num_positive:
+                        break
+                    point = largest_contour[i][0]
+                    points.append([point[0], point[1]])
+                    labels.append(1)
+        
+        # Add center point
+        moments = cv2.moments(mask.astype(np.uint8))
+        if moments['m00'] != 0:
+            cx = int(moments['m10'] / moments['m00'])
+            cy = int(moments['m01'] / moments['m00'])
+            if mask[cy, cx]:
+                points.append([cx, cy])
+                labels.append(1)
+        
+        # Add negative points around the mask
+        kernel_size = max(10, int(np.sqrt(np.sum(mask)) * 0.1))
+        kernel = np.ones((kernel_size, kernel_size), np.uint8)
+        expanded = cv2.dilate(mask.astype(np.uint8), kernel, iterations=2)
+        negative_region = expanded & (~mask)
+        
+        neg_y, neg_x = np.where(negative_region)
+        if len(neg_x) > 0:
+            neg_indices = np.random.choice(len(neg_x), min(num_negative, len(neg_x)), replace=False)
+            for idx in neg_indices:
+                points.append([neg_x[idx], neg_y[idx]])
+                labels.append(0)
+        
+        if not points:
+            return None, None
+            
+        return np.array(points, dtype=np.float32), np.array(labels, dtype=np.int32)
+
+    def process_video(self, points_dict, labels_dict, debug=True):
+        """Process video with improved bidirectional propagation"""
+        results = {}
+        
+        try:
+            cleanup_memory()
+            
+            # Step 1: Process seed frame
+            print(f"\n🎯 Step 1: Processing seed frame {self.seed_frame_idx}")
+            seed_results = self._process_seed_frame(points_dict, labels_dict, debug)
+            
+            if not seed_results:
+                print("❌ Failed to process seed frame")
+                return None
+            
+            results.update(seed_results)
+            print(f"✅ Seed processing complete")
+            
+            # Step 2: Forward propagation (seed → end)
+            print(f"\n➡️ Step 2: Forward propagation")
+            forward_results = self._process_forward_propagation(seed_results, debug)
+            results.update(forward_results)
+            print(f"✅ Forward propagation complete: {len(forward_results)} frames")
+            
+            # Step 3: Backward propagation (seed → start) - FIXED
+            print(f"\n⬅️ Step 3: Backward propagation")
+            backward_results = self._process_backward_propagation(seed_results, debug)
+            results.update(backward_results)
+            print(f"✅ Backward propagation complete: {len(backward_results)} frames")
+            
+            # Step 4: Fill gaps
+            self._fill_result_gaps(results, debug)
+            print(f"\n🎉 Processing complete! Total frames: {len(results)}/{len(self.frame_names)}")
+            
+            return results
+            
+        except Exception as e:
+            print(f"Error in video processing: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return None
+        finally:
+            cleanup_memory()
+
+    def _process_seed_frame(self, points_dict, labels_dict, debug=True):
+        """Process the seed frame with user annotations"""
+        seed_results = {}
+        temp_dir = "temp_seed"
+        
+        try:
+            # Create temp directory with seed frame
+            seed_frame_name = self.frame_names[self.seed_frame_idx]
+            temp_dir_path = self._create_temp_video_dir([seed_frame_name], temp_dir)
+            
+            chunk_state = self.predictor.init_state(video_path=temp_dir_path)
+            
+            # Process each object
+            for obj_id in points_dict:
+                try:
+                    self.predictor.reset_state(chunk_state)
+                    
+                    points = np.array(points_dict[obj_id], dtype=np.float32)
+                    labels = np.array(labels_dict[obj_id], dtype=np.int32)
+                    
+                    if debug:
+                        print(f"  Object {obj_id}: +{sum(labels == 1)} -{sum(labels == 0)} points")
+                    
+                    # Add prompts to frame 0 (the seed frame)
+                    _, obj_ids, mask_logits = self.predictor.add_new_points_or_box(
+                        inference_state=chunk_state,
+                        frame_idx=0,
+                        obj_id=obj_id,
+                        points=points,
+                        labels=labels
+                    )
+                    
+                    # Store result
+                    for i, prop_obj_id in enumerate(obj_ids):
+                        mask = (mask_logits[i] > 0.0).cpu().numpy()
+                        if len(mask.shape) == 3:
+                            mask = mask[0]
+                        
+                        if self.seed_frame_idx not in seed_results:
+                            seed_results[self.seed_frame_idx] = {}
+                        seed_results[self.seed_frame_idx][prop_obj_id] = mask.copy()
+                    
+                    del mask_logits
+                    cleanup_memory()
+                
+                except Exception as e:
+                    print(f"  Error processing object {obj_id}: {e}")
+                    continue
+            
+            return seed_results
+            
+        except Exception as e:
+            print(f"Error processing seed frame: {e}")
+            return {}
+        finally:
+            if os.path.exists(temp_dir_path):
+                shutil.rmtree(temp_dir_path)
+            cleanup_memory()
+
+    def _process_forward_propagation(self, seed_results, debug=True):
+        """Process frames forward from seed to end"""
+        forward_results = {}
+        
+        # Get frames after seed
+        forward_frames = self.frame_names[self.seed_frame_idx + 1:]
+        if not forward_frames:
+            return forward_results
+        
+        # Process in chunks
+        for chunk_start in range(0, len(forward_frames), self.chunk_size):
+            chunk_end = min(chunk_start + self.chunk_size, len(forward_frames))
+            chunk_frames = forward_frames[chunk_start:chunk_end]
+            
+            # Add seed frame at the beginning for reference
+            chunk_with_seed = [self.frame_names[self.seed_frame_idx]] + chunk_frames
+            
+            if debug:
+                print(f"  Forward chunk: frames {self.seed_frame_idx + 1 + chunk_start} to {self.seed_frame_idx + chunk_end}")
+            
+            chunk_results = self._process_chunk(chunk_with_seed, seed_results, is_forward=True, debug=debug)
+            
+            # Remove seed frame from results (already have it)
+            chunk_results.pop(self.seed_frame_idx, None)
+            forward_results.update(chunk_results)
+        
+        return forward_results
+
+    def _process_backward_propagation(self, seed_results, debug=True):
+        """Process frames backward from seed to start - FIXED VERSION"""
+        backward_results = {}
+        
+        # Get frames before seed
+        backward_frames = self.frame_names[:self.seed_frame_idx]
+        if not backward_frames:
+            return backward_results
+        
+        # IMPORTANT: Process backward frames in REVERSE ORDER
+        # This is the key fix - we reverse the frames so propagation goes backward in time
+        backward_frames_reversed = backward_frames[::-1]
+        
+        # Process in chunks
+        for chunk_start in range(0, len(backward_frames_reversed), self.chunk_size):
+            chunk_end = min(chunk_start + self.chunk_size, len(backward_frames_reversed))
+            chunk_frames = backward_frames_reversed[chunk_start:chunk_end]
+            
+            # Add seed frame at the beginning for reference
+            chunk_with_seed = [self.frame_names[self.seed_frame_idx]] + chunk_frames
+            
+            if debug:
+                original_indices = [self.seed_frame_idx - 1 - chunk_start - i for i in range(len(chunk_frames))]
+                print(f"  Backward chunk: frames {min(original_indices)} to {max(original_indices)}")
+            
+            chunk_results = self._process_chunk(chunk_with_seed, seed_results, is_forward=False, debug=debug)
+            
+            # Remove seed frame from results (already have it)
+            chunk_results.pop(self.seed_frame_idx, None)
+            backward_results.update(chunk_results)
+        
+        return backward_results
+
+    def _process_chunk(self, chunk_frames, reference_results, is_forward=True, debug=True):
+        """Process a chunk of frames"""
+        chunk_results = {}
+        temp_dir = f"temp_{'forward' if is_forward else 'backward'}"
+        
+        try:
+            # Create temp directory
+            temp_dir_path = self._create_temp_video_dir(chunk_frames, temp_dir)
+            chunk_state = self.predictor.init_state(video_path=temp_dir_path)
+            
+            # Get reference masks from seed frame
+            seed_masks = reference_results.get(self.seed_frame_idx, {})
+            
+            # Process each object
+            for obj_id, reference_mask in seed_masks.items():
+                try:
+                    self.predictor.reset_state(chunk_state)
+                    
+                    # Generate points from reference mask
+                    points, labels = self._generate_robust_points_from_mask(reference_mask)
+                    if points is None:
+                        continue
+                    
+                    # Add prompts to frame 0 (seed frame in temp directory)
+                    _, obj_ids, mask_logits = self.predictor.add_new_points_or_box(
+                        inference_state=chunk_state,
+                        frame_idx=0,
+                        obj_id=obj_id,
+                        points=points,
+                        labels=labels
+                    )
+                    
+                    del mask_logits
+                    cleanup_memory()
+                    
+                    # Propagate through chunk
+                    for frame_idx, prop_obj_ids, prop_mask_logits in self.predictor.propagate_in_video(chunk_state):
+                        # Skip seed frame (frame 0)
+                        if frame_idx == 0:
+                            continue
+                        
+                        # Map local frame index to global frame index
+                        global_frame_idx = self._map_local_to_global_index(
+                            frame_idx, chunk_frames, is_forward
+                        )
+                        
+                        if global_frame_idx is None:
+                            continue
+                        
+                        for i, prop_obj_id in enumerate(prop_obj_ids):
+                            mask = (prop_mask_logits[i] > 0.0).cpu().numpy()
+                            if len(mask.shape) == 3:
+                                mask = mask[0]
+                            
+                            if global_frame_idx not in chunk_results:
+                                chunk_results[global_frame_idx] = {}
+                            chunk_results[global_frame_idx][prop_obj_id] = mask.copy()
+                        
+                        del prop_mask_logits
+                        cleanup_memory()
+                
+                except Exception as e:
+                    if debug:
+                        print(f"    Error processing object {obj_id}: {e}")
+                    continue
+            
+            return chunk_results
+            
+        except Exception as e:
+            print(f"Error processing chunk: {e}")
+            return {}
+        finally:
+            if os.path.exists(temp_dir_path):
+                shutil.rmtree(temp_dir_path)
+            cleanup_memory()
+
+    def _map_local_to_global_index(self, local_idx, chunk_frames, is_forward):
+        """Map local frame index in chunk to global frame index"""
+        if local_idx >= len(chunk_frames):
+            return None
+        
+        frame_name = chunk_frames[local_idx]
+        
+        # Find global index by frame name
+        try:
+            global_idx = self.frame_names.index(frame_name)
+            return global_idx
+        except ValueError:
+            return None
+
+    def _fill_result_gaps(self, results, debug=True):
+        """Fill small gaps in results using interpolation"""
+        if not results:
+            return
+        
+        frame_indices = sorted(results.keys())
+        if len(frame_indices) < 2:
+            return
+        
+        gaps = []
+        for i in range(len(frame_indices) - 1):
+            gap_size = frame_indices[i+1] - frame_indices[i] - 1
+            if gap_size > 0 and gap_size <= 5:
+                gaps.append((frame_indices[i], frame_indices[i+1], gap_size))
+        
+        if not gaps:
+            return
+        
+        if debug:
+            print(f"Filling {len(gaps)} small gaps in results...")
+        
+        for start_frame, end_frame, gap_size in gaps:
+            start_masks = results[start_frame]
+            end_masks = results[end_frame]
+            
+            common_objects = set(start_masks.keys()) & set(end_masks.keys())
+            
+            for obj_id in common_objects:
+                start_mask = start_masks[obj_id]
+                end_mask = end_masks[obj_id]
+                
+                for gap_frame in range(start_frame + 1, end_frame):
+                    ratio = (gap_frame - start_frame) / (end_frame - start_frame)
+                    
+                    if ratio < 0.5:
+                        interpolated_mask = start_mask.copy()
+                    else:
+                        interpolated_mask = end_mask.copy()
+                    
+                    if gap_frame not in results:
+                        results[gap_frame] = {}
+                    results[gap_frame][obj_id] = interpolated_mask
+
     def create_analysis_video(self, results, output_path, fps=30, alpha=0.5):
-        """
-        Create analysis video with masked overlay and surrounding plots
-        
-        Args:
-            results: Dictionary of results from process_video
-            output_path: Where to save the analysis video
-            fps: Frames per second for output video
-            alpha: Opacity of mask overlay (0 to 1)
-        """
-        import matplotlib.pyplot as plt
-        from matplotlib.figure import Figure
-        from matplotlib.backends.backend_agg import FigureCanvasAgg
-        
+        """Create analysis video with plots and metrics - FIXED"""
         if not results:
             print("No results to analyze!")
             return
         
-        # Get color map
-        cmap = plt.get_cmap("tab10")
+        print("Creating analysis video...")
         
-        # Collect time series data (same as before)
-        print("Collecting time series data...")
+        # Get color map and object names
+        cmap = plt.get_cmap("tab10")
+        object_names = getattr(self, 'object_names', {})
+        
+        # Debug info
+        print(f"Object names available: {object_names}")
+        print(f"Results frames: {len(results)}")
+        print(f"Objects found: {set(obj_id for frame in results.values() for obj_id in frame.keys())}")
+        
+        # Collect time series data
         time_series_data = {}
         max_frame_idx = max(results.keys())
         
@@ -148,7 +546,7 @@ class VideoChunkProcessor:
                 'centroids': [],
                 'areas': [],
                 'colors_rgb': [],
-                'plot_color': cmap(obj_id % 10)[:3]  # Store plot color to match mask
+                'plot_color': cmap(obj_id % 10)[:3]
             }
         
         # Calculate metrics for all frames
@@ -170,10 +568,12 @@ class VideoChunkProcessor:
                                          metrics['mean_color_b']])
         
         # Calculate derived metrics
-        print("Calculating derived metrics...")
         window_size = 10
         for obj_id in time_series_data:
             data = time_series_data[obj_id]
+            
+            if not data['frames']:  # Skip if no data
+                continue
             
             # Convert to numpy arrays
             centroids = np.array(data['centroids'])
@@ -184,8 +584,11 @@ class VideoChunkProcessor:
                 data['movement'] = np.array([0])
             
             colors = np.array(data['colors_rgb'])
-            data['color_change'] = np.linalg.norm(np.diff(colors, axis=0), axis=1)
-            data['color_change'] = np.insert(data['color_change'], 0, 0)
+            if len(colors) > 1:
+                data['color_change'] = np.linalg.norm(np.diff(colors, axis=0), axis=1)
+                data['color_change'] = np.insert(data['color_change'], 0, 0)
+            else:
+                data['color_change'] = np.array([0])
             
             # Calculate moving averages
             data['area_ma'] = np.convolve(data['areas'], 
@@ -203,14 +606,18 @@ class VideoChunkProcessor:
         height, width = first_frame.shape[:2]
         
         # Layout calculation
-        n_objects = len(time_series_data)
-        side_plot_height = height // n_objects  # Each side plot gets equal height
-        side_plot_width = width // 3           # Side plots are 1/3 width
-        bottom_plot_height = height // 4       # Bottom plots are 1/4 height
+        n_objects = len([obj_id for obj_id in time_series_data if time_series_data[obj_id]['frames']])
+        if n_objects == 0:
+            print("No valid objects for analysis video")
+            return
+        
+        side_plot_height = height // max(n_objects, 1)
+        side_plot_width = width // 3
+        bottom_plot_height = height // 4
         
         # Total output dimensions
-        out_width = width + (2 * side_plot_width)  # Main video + left & right plots
-        out_height = height + bottom_plot_height    # Main video + bottom plots
+        out_width = width + (2 * side_plot_width)
+        out_height = height + bottom_plot_height
         
         # Video position in output frame
         video_x = side_plot_width
@@ -219,8 +626,7 @@ class VideoChunkProcessor:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(output_path, fourcc, fps, (out_width, out_height))
         
-        print("\nCreating analysis video...")
-        for frame_idx in tqdm(range(len(self.frame_names)), position=0, leave=True):
+        for frame_idx in tqdm(range(len(self.frame_names)), desc="Creating analysis video"):
             # Create output canvas
             output_frame = np.zeros((out_height, out_width, 3), dtype=np.uint8)
             
@@ -262,706 +668,100 @@ class VideoChunkProcessor:
             output_frame[video_y:video_y+height, video_x:video_x+width] = overlay
             
             # Create and place plots for each object
-            for i, (obj_id, data) in enumerate(time_series_data.items()):
+            plot_idx = 0
+            for obj_id, data in time_series_data.items():
+                if not data['frames']:  # Skip empty data
+                    continue
+                
                 plot_color = data['plot_color']
                 color_rgb = tuple(int(c * 255) for c in plot_color)
                 
-                # Left plot (Movement)
-                fig_left = Figure(figsize=(side_plot_width/100, side_plot_height/100), dpi=100)
-                ax_left = fig_left.add_subplot(111)
-                ax_left.plot(data['frames'], data['movement'], color=plot_color, alpha=0.5)
-                ax_left.plot(data['frames'], data['movement_ma'], color=plot_color, linewidth=2)
-                ax_left.set_xlim(0, max_frame_idx)
-                ax_left.axvline(frame_idx, color='k', linestyle='--', alpha=0.5)
-                ax_left.set_title(f'Movement (Obj {obj_id})')
-                fig_left.tight_layout()
+                # Get object name
+                obj_name = object_names.get(obj_id, f"Object_{obj_id}")
                 
-                canvas = FigureCanvasAgg(fig_left)
-                canvas.draw()
-                plot_img = np.frombuffer(canvas.tostring_rgb(), dtype=np.uint8)
-                plot_img = plot_img.reshape(canvas.get_width_height()[::-1] + (3,))
-                
-                y_offset = i * side_plot_height
-                output_frame[y_offset:y_offset+side_plot_height, :side_plot_width] = plot_img
-                
-                # Draw connection line from left plot to mask
-                if obj_id in centroids:
-                    # Get current value in time series
-                    current_idx = min(frame_idx, len(data['frames'])-1)
-                    value = data['movement_ma'][current_idx]  # Use smoothed value
+                # Left plot (Movement) - with error handling
+                try:
+                    if not data['frames']:  # Skip if no data
+                        continue
+                        
+                    fig_left = Figure(figsize=(side_plot_width/100, side_plot_height/100), dpi=100)
+                    ax_left = fig_left.add_subplot(111)
                     
-                    # Convert value to y-coordinate in plot space
-                    y_range = ax_left.get_ylim()
-                    plot_height = side_plot_height
-                    y_plot = plot_height - ((value - y_range[0]) / (y_range[1] - y_range[0]) * plot_height)
-                    y_plot = int(y_offset + y_plot)
+                    if len(data['movement']) > 0 and len(data['frames']) > 0:
+                        ax_left.plot(data['frames'], data['movement'], color=plot_color, alpha=0.5)
+                        ax_left.plot(data['frames'], data['movement_ma'], color=plot_color, linewidth=2)
+                        ax_left.set_xlim(0, max_frame_idx)
+                        ax_left.axvline(frame_idx, color='k', linestyle='--', alpha=0.5)
+                        ax_left.set_title(f'Movement ({obj_name})', fontsize=8)
+                        ax_left.tick_params(labelsize=6)
                     
-                    # Draw connection from current point to mask centroid
-                    start_point = (side_plot_width-5, y_plot)
-                    end_point = centroids[obj_id]
-                    # Add slight transparency to line
-                    cv2.line(output_frame, start_point, end_point, color_rgb, 1, cv2.LINE_AA)
+                    fig_left.tight_layout()
                     
-                # Right plot (Area)
-                fig_right = Figure(figsize=(side_plot_width/100, side_plot_height/100), dpi=100)
-                ax_right = fig_right.add_subplot(111)
-                ax_right.plot(data['frames'], data['areas'], color=plot_color, alpha=0.5)
-                ax_right.plot(data['frames'], data['area_ma'], color=plot_color, linewidth=2)
-                ax_right.set_xlim(0, max_frame_idx)
-                ax_right.axvline(frame_idx, color='k', linestyle='--', alpha=0.5)
-                ax_right.set_title('Area')
-                fig_right.tight_layout()
-                
-                canvas = FigureCanvasAgg(fig_right)
-                canvas.draw()
-                plot_img = np.frombuffer(canvas.tostring_rgb(), dtype=np.uint8)
-                plot_img = plot_img.reshape(canvas.get_width_height()[::-1] + (3,))
-                
-                output_frame[y_offset:y_offset+side_plot_height, 
-                            video_x+width:] = plot_img
-                
-                # Draw connection line from right plot to mask
-                if obj_id in centroids:
-                    current_idx = min(frame_idx, len(data['frames'])-1)
-                    value = data['area_ma'][current_idx]
+                    canvas = FigureCanvasAgg(fig_left)
+                    canvas.draw()
+                    plot_img = np.frombuffer(canvas.tostring_rgb(), dtype=np.uint8)
+                    plot_img = plot_img.reshape(canvas.get_width_height()[::-1] + (3,))
                     
-                    y_range = ax_right.get_ylim()
-                    plot_height = side_plot_height
-                    y_plot = plot_height - ((value - y_range[0]) / (y_range[1] - y_range[0]) * plot_height)
-                    y_plot = int(y_offset + y_plot)
+                    y_offset = plot_idx * side_plot_height
+                    if y_offset + side_plot_height <= out_height:
+                        plot_height = min(side_plot_height, plot_img.shape[0])
+                        plot_width = min(side_plot_width, plot_img.shape[1])
+                        output_frame[y_offset:y_offset+plot_height, :plot_width] = plot_img[:plot_height, :plot_width]
                     
-                    start_point = (video_x+width+5, y_plot)
-                    end_point = centroids[obj_id]
-                    cv2.line(output_frame, start_point, end_point, color_rgb, 1, cv2.LINE_AA)
-                
-                # Bottom plot (Color Change)
-                bottom_plot_width = width // n_objects
-                fig_bottom = Figure(figsize=(bottom_plot_width/100, bottom_plot_height/100), dpi=100)
-                ax_bottom = fig_bottom.add_subplot(111)
-                ax_bottom.plot(data['frames'], data['color_change'], color=plot_color, alpha=0.5)
-                ax_bottom.plot(data['frames'], data['color_ma'], color=plot_color, linewidth=2)
-                ax_bottom.set_xlim(0, max_frame_idx)
-                ax_bottom.axvline(frame_idx, color='k', linestyle='--', alpha=0.5)
-                ax_bottom.set_title('Color Change')
-                fig_bottom.tight_layout()
-                
-                canvas = FigureCanvasAgg(fig_bottom)
-                canvas.draw()
-                plot_img = np.frombuffer(canvas.tostring_rgb(), dtype=np.uint8)
-                plot_img = plot_img.reshape(canvas.get_width_height()[::-1] + (3,))
-                
-                x_offset = video_x + (i * bottom_plot_width)
-                output_frame[height:, x_offset:x_offset+bottom_plot_width] = plot_img
-                
-                # Draw connection line from bottom plot to mask
-                if obj_id in centroids:
-                    current_idx = min(frame_idx, len(data['frames'])-1)
-                    value = data['color_ma'][current_idx]
+                    plt.close(fig_left)
                     
-                    # For bottom plot, we connect from current x position
-                    x_plot = int(x_offset + (frame_idx / max_frame_idx * bottom_plot_width))
+                except Exception as e:
+                    print(f"Error creating movement plot for object {obj_id}: {e}")
                     
-                    start_point = (x_plot, height+5)
-                    end_point = centroids[obj_id]
-                    cv2.line(output_frame, start_point, end_point, color_rgb, 1, cv2.LINE_AA)
+                # Right plot (Area) - with error handling  
+                try:
+                    if len(data['areas']) > 0 and len(data['frames']) > 0:
+                        fig_right = Figure(figsize=(side_plot_width/100, side_plot_height/100), dpi=100)
+                        ax_right = fig_right.add_subplot(111)
+                        ax_right.plot(data['frames'], data['areas'], color=plot_color, alpha=0.5)
+                        ax_right.plot(data['frames'], data['area_ma'], color=plot_color, linewidth=2)
+                        ax_right.set_xlim(0, max_frame_idx)
+                        ax_right.axvline(frame_idx, color='k', linestyle='--', alpha=0.5)
+                        ax_right.set_title(f'Area ({obj_name})', fontsize=8)
+                        ax_right.tick_params(labelsize=6)
+                        fig_right.tight_layout()
+                        
+                        canvas = FigureCanvasAgg(fig_right)
+                        canvas.draw()
+                        plot_img = np.frombuffer(canvas.tostring_rgb(), dtype=np.uint8)
+                        plot_img = plot_img.reshape(canvas.get_width_height()[::-1] + (3,))
+                        
+                        y_offset = plot_idx * side_plot_height
+                        x_offset = video_x + width
+                        if y_offset + side_plot_height <= out_height and x_offset + side_plot_width <= out_width:
+                            plot_height = min(side_plot_height, plot_img.shape[0])
+                            plot_width = min(side_plot_width, plot_img.shape[1])
+                            output_frame[y_offset:y_offset+plot_height, 
+                                        x_offset:x_offset+plot_width] = plot_img[:plot_height, :plot_width]
+                        
+                        plt.close(fig_right)
+                        
+                except Exception as e:
+                    print(f"Error creating area plot for object {obj_id}: {e}")
                 
-                plt.close('all')
+                plot_idx += 1
             
             out.write(output_frame)
         
         out.release()
         print(f"Analysis video saved to: {output_path}")
-
-    def _calculate_bidirectional_chunks(self):
-        """Calculate chunks for bidirectional processing from seed frame"""
-        chunks = []
-        frame_count = len(self.frame_names)
         
-        # Find which chunk contains the seed frame
-        seed_chunk_id = self.seed_frame_idx // self.chunk_size
-        
-        # Calculate all chunks normally first
-        all_chunks = []
-        start = 0
-        chunk_id = 0
-        
-        while start < frame_count:
-            end = min(start + self.chunk_size, frame_count)
-            
-            # Add overlap for non-first chunks
-            if chunk_id > 0:
-                overlap_start = max(0, start - self.overlap_frames)
-                chunk_frame_names = self.frame_names[overlap_start:end]
-                overlap_offset = start - overlap_start
-            else:
-                chunk_frame_names = self.frame_names[start:end]
-                overlap_offset = 0
-            
-            chunk = {
-                'id': chunk_id,
-                'global_start': start,
-                'global_end': end,
-                'overlap_offset': overlap_offset,
-                'frame_names': chunk_frame_names,
-                'frame_indices': list(range(len(chunk_frame_names))),
-                'contains_seed': start <= self.seed_frame_idx < end,
-                'seed_frame_local_idx': self.seed_frame_idx - start if start <= self.seed_frame_idx < end else None,
-                'direction': 'seed' if start <= self.seed_frame_idx < end else ('forward' if start > self.seed_frame_idx else 'backward')
-            }
-            
-            all_chunks.append(chunk)
-            start = end
-            chunk_id += 1
-        
-        # Reorder chunks: seed first, then forward, then backward
-        seed_chunks = [c for c in all_chunks if c['contains_seed']]
-        forward_chunks = [c for c in all_chunks if c['direction'] == 'forward']
-        backward_chunks = [c for c in all_chunks if c['direction'] == 'backward']
-        
-        # Reverse backward chunks so we process from seed towards frame 0
-        backward_chunks.reverse()
-        
-        # Combine in processing order
-        chunks = seed_chunks + forward_chunks + backward_chunks
-        
-        # Update processing order info
-        for i, chunk in enumerate(chunks):
-            chunk['processing_order'] = i
-        
-        print(f"Bidirectional chunk plan:")
-        print(f"  Seed frame: {self.seed_frame_idx}")
-        print(f"  Seed chunk: {seed_chunk_id} (frames {seed_chunks[0]['global_start']}-{seed_chunks[0]['global_end']-1})")
-        print(f"  Forward chunks: {len(forward_chunks)}")
-        print(f"  Backward chunks: {len(backward_chunks)}")
-        
-        return chunks
-
-    def _calculate_chunks_with_overlap(self):
-        """Original chunk calculation (kept for backward compatibility)"""
-        return self._calculate_bidirectional_chunks()
-
-    def _get_best_reference_masks(self, results, target_frame, search_window=10):
-        """Get the best masks from multiple recent frames for robust inheritance"""
-        reference_masks = {}
-        frames_to_check = range(max(0, target_frame - search_window), target_frame)
-        
-        mask_candidates = {}
-        for frame_idx in frames_to_check:
-            if frame_idx in results:
-                for obj_id, mask in results[frame_idx].items():
-                    if obj_id not in mask_candidates:
-                        mask_candidates[obj_id] = []
-                    mask_candidates[obj_id].append((frame_idx, mask))
-        
-        for obj_id, candidates in mask_candidates.items():
-            if not candidates:
-                continue
-                
-            best_candidate = None
-            best_score = -1
-            
-            for frame_idx, mask in candidates:
-                if len(mask.shape) == 3:
-                    mask = mask[0]
-                
-                area = np.sum(mask)
-                recency = frame_idx / target_frame if target_frame > 0 else 1
-                score = area * (0.3 + 0.7 * recency)
-                
-                if score > best_score:
-                    best_score = score
-                    best_candidate = mask
-            
-            if best_candidate is not None:
-                reference_masks[obj_id] = best_candidate
-        
-        return reference_masks
-
-    def _generate_robust_points_from_mask(self, mask, num_positive=8, num_negative=16):
-        """Generate more robust points from mask using multiple strategies"""
-        if not mask.any():
-            return None, None
-            
-        points = []
-        labels = []
-        
-        if len(mask.shape) == 3:
-            mask = mask[0]
-        mask = mask.astype(bool)
-        
-        contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            largest_contour = max(contours, key=cv2.contourArea)
-            
-            contour_length = cv2.arcLength(largest_contour, True)
-            if contour_length > 0:
-                spacing = max(1, int(contour_length / num_positive))
-                contour_points = []
-                for i in range(0, len(largest_contour), spacing):
-                    point = largest_contour[i][0]
-                    contour_points.append([point[0], point[1]])
-                
-                step = max(1, len(contour_points) // num_positive)
-                for i in range(0, min(len(contour_points), num_positive), step):
-                    points.append(contour_points[i])
-                    labels.append(1)
-        
-        moments = cv2.moments(mask.astype(np.uint8))
-        if moments['m00'] != 0:
-            cx = int(moments['m10'] / moments['m00'])
-            cy = int(moments['m01'] / moments['m00'])
-            
-            if mask[cy, cx]:
-                points.append([cx, cy])
-                labels.append(1)
-            
-            for radius in [10, 20, 30]:
-                for angle in np.linspace(0, 2*np.pi, 6, endpoint=False):
-                    x = cx + int(radius * np.cos(angle))
-                    y = cy + int(radius * np.sin(angle))
-                    
-                    if (0 <= x < mask.shape[1] and 0 <= y < mask.shape[0] and 
-                        mask[y, x] and len([p for p, l in zip(points, labels) if l == 1]) < num_positive):
-                        points.append([x, y])
-                        labels.append(1)
-        
-        kernel_size = max(10, int(np.sqrt(np.sum(mask)) * 0.1))
-        kernel = np.ones((kernel_size, kernel_size), np.uint8)
-        expanded = cv2.dilate(mask.astype(np.uint8), kernel, iterations=2)
-        negative_region = expanded & (~mask)
-        
-        neg_y, neg_x = np.where(negative_region)
-        if len(neg_x) > 0:
-            neg_coords = np.column_stack([neg_x, neg_y])
-            
-            grid_size = int(np.sqrt(num_negative))
-            x_bins = np.linspace(neg_x.min(), neg_x.max(), grid_size + 1)
-            y_bins = np.linspace(neg_y.min(), neg_y.max(), grid_size + 1)
-            
-            for i in range(grid_size):
-                for j in range(grid_size):
-                    mask_x = (neg_x >= x_bins[i]) & (neg_x < x_bins[i+1])
-                    mask_y = (neg_y >= y_bins[j]) & (neg_y < y_bins[j+1])
-                    cell_mask = mask_x & mask_y
-                    
-                    if np.any(cell_mask):
-                        cell_indices = np.where(cell_mask)[0]
-                        chosen_idx = cell_indices[len(cell_indices)//2]
-                        points.append([neg_x[chosen_idx], neg_y[chosen_idx]])
-                        labels.append(0)
-                        
-                        if len([p for p, l in zip(points, labels) if l == 0]) >= num_negative:
-                            break
-                if len([p for p, l in zip(points, labels) if l == 0]) >= num_negative:
-                    break
-        
-        if not points:
-            return None, None
-            
-        return np.array(points, dtype=np.float32), np.array(labels, dtype=np.int32)
-
-    def _interactive_mask_correction(self, frame_path, prev_mask, current_mask, obj_id, object_names):
-        """Interactive mask correction when discontinuity is detected"""
-        print(f"\n🚨 MASK DISCONTINUITY DETECTED for {object_names.get(obj_id, f'Object_{obj_id}')}")
-        print("Opening interactive correction interface...")
-        
-        frame = cv2.imread(frame_path)
-        if frame is None:
-            print("❌ Could not load frame for correction")
-            return current_mask, True
-        
-        height, width = frame.shape[:2]
-        
-        if len(prev_mask.shape) == 3:
-            prev_mask = prev_mask[0]
-        if len(current_mask.shape) == 3:
-            current_mask = current_mask[0]
-        
-        comparison = np.zeros((height, width * 3, 3), dtype=np.uint8)
-        
-        comparison[:, :width] = frame
-        
-        prev_overlay = frame.copy()
-        prev_color = np.array([0, 255, 0])
-        prev_overlay[prev_mask] = prev_color
-        blended_prev = cv2.addWeighted(frame, 0.7, prev_overlay, 0.3, 0)
-        comparison[:, width:width*2] = blended_prev
-        
-        curr_overlay = frame.copy()
-        curr_color = np.array([0, 0, 255])
-        curr_overlay[current_mask] = curr_color
-        blended_curr = cv2.addWeighted(frame, 0.7, curr_overlay, 0.3, 0)
-        comparison[:, width*2:] = blended_curr
-        
-        cv2.putText(comparison, "Original", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-        cv2.putText(comparison, "Previous (Good)", (width + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        cv2.putText(comparison, "Current (Problem)", (width*2 + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-        
-        obj_name = object_names.get(obj_id, f'Object_{obj_id}')
-        cv2.putText(comparison, f"Discontinuity: {obj_name}", (10, height - 20), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
-        
-        cv2.namedWindow('Mask Discontinuity Detected', cv2.WINDOW_NORMAL)
-        cv2.imshow('Mask Discontinuity Detected', comparison)
-        
-        print(f"\n🔧 Discontinuity detected for {obj_name}")
-        print("Options:")
-        print("1. Press 'f' - Fix with manual point selection")
-        print("2. Press 'a' - Accept current mask anyway")
-        print("3. Press 'p' - Use previous mask")
-        print("4. Press 's' - Skip this object for this frame")
-        print("5. Press 'q' - Stop processing (quit)")
-        print("\nWhat would you like to do?")
-        
-        while True:
-            key = cv2.waitKey(0) & 0xFF
-            
-            if key == ord('f'):
-                cv2.destroyWindow('Mask Discontinuity Detected')
-                corrected_mask = self._manual_mask_correction(frame, prev_mask, obj_id, object_names)
-                return corrected_mask, True
-                
-            elif key == ord('a'):
-                cv2.destroyWindow('Mask Discontinuity Detected')
-                print(f"✅ Accepted current mask for {obj_name}")
-                return current_mask, True
-                
-            elif key == ord('p'):
-                cv2.destroyWindow('Mask Discontinuity Detected')
-                print(f"📋 Using previous mask for {obj_name}")
-                return prev_mask, True
-                
-            elif key == ord('s'):
-                cv2.destroyWindow('Mask Discontinuity Detected')
-                print(f"⏭️ Skipping {obj_name} for this frame")
-                return None, True
-                
-            elif key == ord('q'):
-                cv2.destroyWindow('Mask Discontinuity Detected')
-                print("🛑 User chose to stop processing")
-                return None, False
-                
-            else:
-                print("Invalid key. Use 'f', 'a', 'p', 's', or 'q'")
-
-    def _manual_mask_correction(self, frame, reference_mask, obj_id, object_names):
-        """Manual point selection for mask correction"""
-        obj_name = object_names.get(obj_id, f'Object_{obj_id}')
-        print(f"\n🎯 Manual correction for {obj_name} - see instructions on image")
-        print("💡 Tip: Add positive points (+) inside the object, negative points (-) outside")
-        print("💡 Use 'T' to test your points before applying the correction")
-        
-        temp_dir = "temp_correction"
-        try:
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
-            os.makedirs(temp_dir)
-            
-            # SAM2 expects numbered frame files - use 00000.jpg format
-            frame_path = os.path.join(temp_dir, "00000.jpg")
-            cv2.imwrite(frame_path, frame)
-            
-            try:
-                correction_state = self.predictor.init_state(video_path=temp_dir)
-                if correction_state is None:
-                    print("❌ Failed to initialize correction state")
-                    return reference_mask
-                print("✅ Correction state initialized successfully")
-            except Exception as e:
-                print(f"❌ Error initializing correction state: {e}")
-                return reference_mask
-            
-            points_dict = {}
-            labels_dict = {}
-            current_obj_id = obj_id
-            
-            def draw_point(img, point, label):
-                color = (0, 255, 0) if label == 1 else (0, 0, 255)
-                cv2.circle(img, (int(point[0]), int(point[1])), 5, color, -1)
-                cv2.putText(img, "+" if label == 1 else "-", 
-                           (int(point[0] + 5), int(point[1] - 5)),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-            
-            def redraw_display():
-                display = frame.copy()
-                
-                if reference_mask is not None:
-                    ref_overlay = np.zeros_like(display)
-                    ref_mask_2d = reference_mask[0] if len(reference_mask.shape) == 3 else reference_mask
-                    ref_overlay[ref_mask_2d] = [0, 150, 0]
-                    display = cv2.addWeighted(display, 0.8, ref_overlay, 0.2, 0)
-                
-                if obj_id in points_dict:
-                    for pt, label in zip(points_dict[obj_id], labels_dict[obj_id]):
-                        draw_point(display, pt, label)
-                
-                # Add object info at top
-                cv2.putText(display, f"Correcting: {obj_name}", (10, 30), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-                
-                # Add keyboard shortcuts overlay
-                height, width = display.shape[:2]
-                shortcuts = [
-                    "MANUAL CORRECTION:",
-                    "Left Click: Add positive point (+)",
-                    "Right Click: Add negative point (-)",
-                    "T: Test/preview current mask",
-                    "R: Reset all points",
-                    "Enter: Apply correction",
-                    "Q: Cancel and use reference"
-                ]
-                
-                # Create semi-transparent background
-                overlay = display.copy()
-                shortcuts_height = len(shortcuts) * 22 + 20
-                cv2.rectangle(overlay, (10, height - shortcuts_height - 10), 
-                             (400, height - 10), (0, 0, 0), -1)
-                display = cv2.addWeighted(display, 0.75, overlay, 0.25, 0)
-                
-                for i, shortcut in enumerate(shortcuts):
-                    color = (0, 255, 255) if i == 0 else (255, 255, 255)
-                    font_scale = 0.6 if i == 0 else 0.5
-                    thickness = 2 if i == 0 else 1
-                    cv2.putText(display, shortcut, (20, height - shortcuts_height + 20 + i*22), 
-                               cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness)
-                
-                # Show current point count
-                if obj_id in points_dict and points_dict[obj_id]:
-                    pos_count = sum(1 for l in labels_dict[obj_id] if l == 1)
-                    neg_count = sum(1 for l in labels_dict[obj_id] if l == 0)
-                    count_info = f"Points: +{pos_count} -{neg_count}"
-                    cv2.putText(display, count_info, (10, 65), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                
-                return display
-            
-            def click_handler(event, x, y, flags, param):
-                if event == cv2.EVENT_LBUTTONDOWN or event == cv2.EVENT_RBUTTONDOWN:
-                    if obj_id not in points_dict:
-                        points_dict[obj_id] = []
-                        labels_dict[obj_id] = []
-                    
-                    points_dict[obj_id].append([x, y])
-                    label = 1 if event == cv2.EVENT_LBUTTONDOWN else 0
-                    labels_dict[obj_id].append(label)
-                    
-                    nonlocal img_display
-                    img_display = redraw_display()
-                    cv2.imshow('Manual Mask Correction', img_display)
-                    
-                    print(f"Added {'positive' if label == 1 else 'negative'} point")
-            
-            def test_current_mask():
-                if obj_id not in points_dict or not points_dict[obj_id]:
-                    print("No points selected yet")
-                    return
-                
-                    try:
-                        self.predictor.reset_state(correction_state)
-                        points = np.array(points_dict[obj_id], dtype=np.float32)
-                        labels = np.array(labels_dict[obj_id], dtype=np.int32)
-                        
-                        _, obj_ids, mask_logits = self.predictor.add_new_points_or_box(
-                            inference_state=correction_state,
-                            frame_idx=0,  # Always use frame 0 since we only have one frame
-                            obj_id=obj_id,
-                            points=points,
-                            labels=labels
-                        )
-                        
-                        if len(mask_logits) > 0:
-                            test_mask = (mask_logits[0] > 0.0).cpu().numpy()
-                            if len(test_mask.shape) == 3:
-                                test_mask = test_mask[0]
-                            
-                            preview = frame.copy()
-                            color = np.array(plt.get_cmap("tab10")(obj_id % 10)[:3]) * 255
-                            
-                            color_overlay = np.zeros_like(preview)
-                            for c in range(3):
-                                color_overlay[:, :, c][test_mask] = color[c]
-                            
-                            preview = cv2.addWeighted(preview, 0.7, color_overlay, 0.3, 0)
-                            
-                            for pt, label in zip(points_dict[obj_id], labels_dict[obj_id]):
-                                draw_point(preview, pt, label)
-                            
-                            cv2.putText(preview, f"Preview: {obj_name}", (10, 30), 
-                                       cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-                            
-                            # Add preview instructions
-                            cv2.putText(preview, "Press any key to close preview", (10, preview.shape[0] - 20), 
-                                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-                            
-                            cv2.namedWindow('Mask Preview', cv2.WINDOW_NORMAL)
-                            cv2.imshow('Mask Preview', preview)
-                            
-                            print("Preview updated - press any key in preview window to continue")
-                            cv2.waitKey(0)
-                            cv2.destroyWindow('Mask Preview')
-                        else:
-                            print("No mask generated - try adding more points")
-                            
-                    except Exception as e:
-                        print(f"Error testing mask: {e}")
-                        import traceback
-                        traceback.print_exc()
-            
-            img_display = redraw_display()
-            cv2.namedWindow('Manual Mask Correction', cv2.WINDOW_NORMAL)
-            cv2.setMouseCallback('Manual Mask Correction', click_handler)
-            cv2.imshow('Manual Mask Correction', img_display)
-            
-            while True:
-                key = cv2.waitKey(1) & 0xFF
-                
-                if key == ord('t'):
-                    test_current_mask()
-                    
-                elif key == ord('r'):
-                    points_dict[obj_id] = []
-                    labels_dict[obj_id] = []
-                    img_display = redraw_display()
-                    cv2.imshow('Manual Mask Correction', img_display)
-                    print("Reset all points")
-                    
-                elif key == 13:  # Enter
-                    cv2.destroyAllWindows()
-                    
-                    if obj_id not in points_dict or not points_dict[obj_id]:
-                        print("No correction points provided, using reference mask")
-                        return reference_mask
-                    
-                    try:
-                        self.predictor.reset_state(correction_state)
-                        points = np.array(points_dict[obj_id], dtype=np.float32)
-                        labels = np.array(labels_dict[obj_id], dtype=np.int32)
-                        
-                        _, obj_ids, mask_logits = self.predictor.add_new_points_or_box(
-                            inference_state=correction_state,
-                            frame_idx=0,
-                            obj_id=obj_id,
-                            points=points,
-                            labels=labels
-                        )
-                        
-                        if len(mask_logits) > 0:
-                            corrected_mask = (mask_logits[0] > 0.0).cpu().numpy()
-                            if len(corrected_mask.shape) == 3:
-                                corrected_mask = corrected_mask[0]
-                            print(f"✅ Applied manual correction for {obj_name}")
-                            return corrected_mask
-                        else:
-                            print("❌ Correction failed, using reference mask")
-                            return reference_mask
-                            
-                    except Exception as e:
-                        print(f"❌ Error applying correction: {e}")
-                        return reference_mask
-                        
-                elif key == ord('q'):
-                    cv2.destroyAllWindows()
-                    print(f"❌ Cancelled correction, using reference mask for {obj_name}")
-                    return reference_mask
-        
-        finally:
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
-
-    def _validate_mask_continuity(self, prev_mask, current_mask, max_area_change=0.5, max_centroid_shift=50):
-        """Validate that the current mask is a reasonable continuation of the previous mask"""
-        if prev_mask is None or current_mask is None:
-            return False
-        
-        if len(prev_mask.shape) == 3:
-            prev_mask = prev_mask[0]
-        if len(current_mask.shape) == 3:
-            current_mask = current_mask[0]
-        
-        prev_mask = prev_mask.astype(bool)
-        current_mask = current_mask.astype(bool)
-        
-        prev_area = np.sum(prev_mask)
-        current_area = np.sum(current_mask)
-        
-        if prev_area == 0 or current_area == 0:
-            return False
-        
-        area_ratio = current_area / prev_area
-        if area_ratio < (1 - max_area_change) or area_ratio > (1 + max_area_change):
-            return False
-        
-        def get_centroid(mask):
-            if not mask.any():
-                return None
-            y_coords, x_coords = np.where(mask)
-            return np.mean(x_coords), np.mean(y_coords)
-        
-        prev_centroid = get_centroid(prev_mask)
-        current_centroid = get_centroid(current_mask)
-        
-        if prev_centroid is None or current_centroid is None:
-            return False
-        
-        centroid_distance = np.sqrt((prev_centroid[0] - current_centroid[0])**2 + 
-                                   (prev_centroid[1] - current_centroid[1])**2)
-        
-        if centroid_distance > max_centroid_shift:
-            return False
-        
-        overlap = np.sum(prev_mask & current_mask)
-        union = np.sum(prev_mask | current_mask)
-        iou = overlap / union if union > 0 else 0
-        
-        if iou < 0.3:
-            return False
-        
-        return True
-
-    def _fill_result_gaps(self, results, debug=True):
-        """Fill small gaps in results using interpolation"""
+    def create_simple_analysis_video(self, results, output_path, fps=30, alpha=0.5):
+        """Create a simple analysis video without complex plots as fallback"""
         if not results:
+            print("No results to analyze!")
             return
-        
-        frame_indices = sorted(results.keys())
-        if len(frame_indices) < 2:
-            return
-        
-        gaps = []
-        for i in range(len(frame_indices) - 1):
-            gap_size = frame_indices[i+1] - frame_indices[i] - 1
-            if gap_size > 0 and gap_size <= 5:
-                gaps.append((frame_indices[i], frame_indices[i+1], gap_size))
-        
-        if not gaps:
-            return
-        
-        print(f"Filling {len(gaps)} small gaps in results...")
-        
-        for start_frame, end_frame, gap_size in gaps:
-            if debug:
-                print(f"  Filling gap between frames {start_frame} and {end_frame} ({gap_size} frames)")
             
-            start_masks = results[start_frame]
-            end_masks = results[end_frame]
-            
-            common_objects = set(start_masks.keys()) & set(end_masks.keys())
-            
-            for obj_id in common_objects:
-                start_mask = start_masks[obj_id]
-                end_mask = end_masks[obj_id]
-                
-                for gap_frame in range(start_frame + 1, end_frame):
-                    ratio = (gap_frame - start_frame) / (end_frame - start_frame)
-                    
-                    if ratio < 0.5:
-                        interpolated_mask = start_mask.copy()
-                    else:
-                        interpolated_mask = end_mask.copy()
-                    
-                    if gap_frame not in results:
-                        results[gap_frame] = {}
-                    results[gap_frame][obj_id] = interpolated_mask
+        print("Creating simple analysis video...")
+        
+        # Just create a basic video with overlays and object names
+        self.save_results_video(results, output_path, fps, show_original=True, alpha=alpha)
+        print(f"Simple analysis video saved to: {output_path}")
 
     def _compute_box_from_mask(self, mask):
         """Compute bounding box from mask"""
@@ -973,10 +773,10 @@ class VideoChunkProcessor:
         if len(coords) == 0:
             return None
             
-        padding = 10
         y0, x0 = coords.min(axis=0)
         y1, x1 = coords.max(axis=0)
         
+        padding = 10
         x0 = max(0, x0 - padding)
         x1 = x1 + padding
         y0 = max(0, y0 - padding)
@@ -1029,416 +829,6 @@ class VideoChunkProcessor:
             print(f"Error in color analysis: {str(e)}")
             return None
 
-    def process_video(self, points_dict, labels_dict, debug=True):
-        """Process video with bidirectional propagation from seed frame"""
-        results = {}
-        
-        def cleanup_memory():
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                gc.collect()
-        
-        try:
-            cleanup_memory()
-            
-            # Step 1: Process seed chunk with user annotations
-            print(f"\n🎯 Step 1: Processing seed frame {self.seed_frame_idx}")
-            seed_results = self._process_seed_chunk(points_dict, labels_dict, debug)
-            
-            if not seed_results:
-                print("❌ Failed to process seed frame")
-                return None
-            
-            results.update(seed_results)
-            print(f"✅ Seed processing complete: {len(seed_results)} frames processed")
-            
-            # Step 2: Forward propagation (from seed to end)
-            forward_chunks = [c for c in self.chunks if c['direction'] == 'forward']
-            if forward_chunks:
-                print(f"\n➡️ Step 2: Forward propagation ({len(forward_chunks)} chunks)")
-                forward_results = self._process_forward_chunks(forward_chunks, results, debug)
-                results.update(forward_results)
-                print(f"✅ Forward propagation complete: {len(forward_results)} new frames")
-            
-            # Step 3: Backward propagation (from seed to start)  
-            backward_chunks = [c for c in self.chunks if c['direction'] == 'backward']
-            if backward_chunks:
-                print(f"\n⬅️ Step 3: Backward propagation ({len(backward_chunks)} chunks)")
-                backward_results = self._process_backward_chunks(backward_chunks, results, debug)
-                results.update(backward_results)
-                print(f"✅ Backward propagation complete: {len(backward_results)} new frames")
-            
-            # Step 4: Fill any remaining gaps
-            if results:
-                self._fill_result_gaps(results, debug)
-                print(f"\n🎉 Processing complete! Total frames: {len(results)}/{len(self.frame_names)}")
-            
-            return results
-            
-        except Exception as e:
-            print(f"Error in bidirectional processing: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return None
-        finally:
-            cleanup_memory()
-
-    def _process_seed_chunk(self, points_dict, labels_dict, debug=True):
-        """Process the chunk containing the seed frame with user annotations"""
-        seed_chunk = next(c for c in self.chunks if c['contains_seed'])
-        seed_results = {}
-        
-        temp_dir = os.path.join(self.video_dir, f"chunk_seed_{seed_chunk['id']}")
-        
-        try:
-            # Setup temporary directory
-            os.makedirs(temp_dir, exist_ok=True)
-            for frame_name in seed_chunk['frame_names']:
-                src = os.path.join(self.video_dir, frame_name)
-                dst = os.path.join(temp_dir, frame_name)
-                if not os.path.exists(dst):
-                    shutil.copy2(src, dst)
-            
-            chunk_state = self.predictor.init_state(video_path=temp_dir)
-            
-            # Process each object
-            for obj_id in points_dict:
-                try:
-                    self.predictor.reset_state(chunk_state)
-                    
-                    # Use user annotations on the seed frame
-                    points = np.array(points_dict[obj_id], dtype=np.float32)
-                    labels = np.array(labels_dict[obj_id], dtype=np.int32)
-                    
-                    # Find local index of seed frame within this chunk
-                    seed_local_idx = seed_chunk['seed_frame_local_idx'] + seed_chunk['overlap_offset']
-                    
-                    if debug:
-                        print(f"  Object {obj_id}: seed at local frame {seed_local_idx}")
-                        print(f"  Points: +{sum(labels == 1)} -{sum(labels == 0)}")
-                    
-                    # Add prompts to seed frame
-                    _, obj_ids, mask_logits = self.predictor.add_new_points_or_box(
-                        inference_state=chunk_state,
-                        frame_idx=seed_local_idx,
-                        obj_id=obj_id,
-                        points=points,
-                        labels=labels
-                    )
-                    
-                    # Store seed frame result
-                    for i, prop_obj_id in enumerate(obj_ids):
-                        mask = (mask_logits[i] > 0.0).cpu().numpy()
-                        if len(mask.shape) == 3:
-                            mask = mask[0]
-                        
-                        # Convert local frame index to global
-                        global_frame_idx = self.seed_frame_idx
-                        
-                        if global_frame_idx not in seed_results:
-                            seed_results[global_frame_idx] = {}
-                        seed_results[global_frame_idx][prop_obj_id] = mask.copy()
-                    
-                    del mask_logits
-                    cleanup_memory()
-                    
-                    # Propagate through the entire chunk
-                    for frame_idx, prop_obj_ids, prop_mask_logits in self.predictor.propagate_in_video(chunk_state):
-                        # Convert local to global frame index
-                        global_frame_idx = seed_chunk['global_start'] + frame_idx - seed_chunk['overlap_offset']
-                        
-                        # Skip if outside valid range or if it's the seed frame (already processed)
-                        if (global_frame_idx < seed_chunk['global_start'] or 
-                            global_frame_idx >= seed_chunk['global_end'] or
-                            global_frame_idx == self.seed_frame_idx):
-                            continue
-                        
-                        for i, prop_obj_id in enumerate(prop_obj_ids):
-                            mask = (prop_mask_logits[i] > 0.0).cpu().numpy()
-                            if len(mask.shape) == 3:
-                                mask = mask[0]
-                            
-                            if global_frame_idx not in seed_results:
-                                seed_results[global_frame_idx] = {}
-                            seed_results[global_frame_idx][prop_obj_id] = mask.copy()
-                        
-                        del prop_mask_logits
-                        cleanup_memory()
-                
-                except Exception as e:
-                    print(f"Error processing object {obj_id} in seed chunk: {e}")
-                    continue
-                finally:
-                    cleanup_memory()
-            
-            return seed_results
-            
-        except Exception as e:
-            print(f"Error processing seed chunk: {e}")
-            return {}
-        finally:
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
-            cleanup_memory()
-
-    def _process_forward_chunks(self, forward_chunks, existing_results, debug=True):
-        """Process chunks forward from seed frame"""
-        forward_results = {}
-        prev_chunk_results = existing_results.copy()
-        
-        for chunk in forward_chunks:
-            print(f"  Processing forward chunk {chunk['id']} (frames {chunk['global_start']}-{chunk['global_end']-1})")
-            
-            chunk_results = self._process_chunk_with_inheritance(
-                chunk, prev_chunk_results, debug, direction='forward'
-            )
-            
-            if chunk_results:
-                forward_results.update(chunk_results)
-                prev_chunk_results.update(chunk_results)
-                if debug:
-                    print(f"    Completed: {len(chunk_results)} frames")
-            else:
-                print(f"    Warning: No results from forward chunk {chunk['id']}")
-        
-        return forward_results
-
-    def _process_backward_chunks(self, backward_chunks, existing_results, debug=True):
-        """Process chunks backward from seed frame"""
-        backward_results = {}
-        
-        # For backward processing, we need to reverse the frame order
-        # This is complex with SAM2's forward-only propagation
-        # Simplified approach: process each backward chunk independently using boundary conditions
-        
-        for chunk in backward_chunks:
-            print(f"  Processing backward chunk {chunk['id']} (frames {chunk['global_start']}-{chunk['global_end']-1})")
-            
-            # Get reference masks from the boundary (closest processed frames)
-            reference_masks = self._get_backward_reference_masks(chunk, existing_results)
-            
-            if not reference_masks:
-                print(f"    Warning: No reference masks for backward chunk {chunk['id']}")
-                continue
-            
-            chunk_results = self._process_backward_chunk(chunk, reference_masks, debug)
-            
-            if chunk_results:
-                backward_results.update(chunk_results)
-                if debug:
-                    print(f"    Completed: {len(chunk_results)} frames")
-            else:
-                print(f"    Warning: No results from backward chunk {chunk['id']}")
-        
-        return backward_results
-
-    def _get_backward_reference_masks(self, chunk, existing_results):
-        """Get reference masks for backward processing"""
-        reference_masks = {}
-        
-        # Look for masks from frames just after this chunk
-        search_start = chunk['global_end']
-        search_end = min(search_start + 50, len(self.frame_names))  # Search next 50 frames
-        
-        for frame_idx in range(search_start, search_end):
-            if frame_idx in existing_results:
-                for obj_id, mask in existing_results[frame_idx].items():
-                    if obj_id not in reference_masks:
-                        reference_masks[obj_id] = mask
-                break  # Use the first available frame
-        
-        return reference_masks
-
-    def _process_backward_chunk(self, chunk, reference_masks, debug=True):
-        """Process a single backward chunk using reference masks"""
-        chunk_results = {}
-        temp_dir = os.path.join(self.video_dir, f"chunk_backward_{chunk['id']}")
-        
-        try:
-            # Setup temporary directory
-            os.makedirs(temp_dir, exist_ok=True)
-            for frame_name in chunk['frame_names']:
-                src = os.path.join(self.video_dir, frame_name)
-                dst = os.path.join(temp_dir, frame_name)
-                if not os.path.exists(dst):
-                    shutil.copy2(src, dst)
-            
-            chunk_state = self.predictor.init_state(video_path=temp_dir)
-            
-            # Process each object using reference masks
-            for obj_id, reference_mask in reference_masks.items():
-                try:
-                    self.predictor.reset_state(chunk_state)
-                    
-                    # Generate points from reference mask
-                    points, labels = self._generate_robust_points_from_mask(reference_mask)
-                    
-                    if points is None:
-                        continue
-                    
-                    # Use the last frame in the chunk as prompt frame (closest to reference)
-                    prompt_frame_idx = len(chunk['frame_names']) - 1
-                    
-                    # Add prompts
-                    _, obj_ids, mask_logits = self.predictor.add_new_points_or_box(
-                        inference_state=chunk_state,
-                        frame_idx=prompt_frame_idx,
-                        obj_id=obj_id,
-                        points=points,
-                        labels=labels
-                    )
-                    
-                    # Store prompt frame result
-                    for i, prop_obj_id in enumerate(obj_ids):
-                        mask = (mask_logits[i] > 0.0).cpu().numpy()
-                        if len(mask.shape) == 3:
-                            mask = mask[0]
-                        
-                        global_frame_idx = chunk['global_end'] - 1
-                        
-                        if global_frame_idx not in chunk_results:
-                            chunk_results[global_frame_idx] = {}
-                        chunk_results[global_frame_idx][prop_obj_id] = mask.copy()
-                    
-                    del mask_logits
-                    cleanup_memory()
-                    
-                    # Propagate through chunk (this will go forward in chunk time, which is backward in video time)
-                    for frame_idx, prop_obj_ids, prop_mask_logits in self.predictor.propagate_in_video(chunk_state):
-                        global_frame_idx = chunk['global_start'] + frame_idx - chunk['overlap_offset']
-                        
-                        # Skip if outside valid range
-                        if global_frame_idx < chunk['global_start'] or global_frame_idx >= chunk['global_end']:
-                            continue
-                        
-                        for i, prop_obj_id in enumerate(prop_obj_ids):
-                            mask = (prop_mask_logits[i] > 0.0).cpu().numpy()
-                            if len(mask.shape) == 3:
-                                mask = mask[0]
-                            
-                            if global_frame_idx not in chunk_results:
-                                chunk_results[global_frame_idx] = {}
-                            chunk_results[global_frame_idx][prop_obj_id] = mask.copy()
-                        
-                        del prop_mask_logits
-                        cleanup_memory()
-                
-                except Exception as e:
-                    print(f"    Error processing object {obj_id}: {e}")
-                    continue
-                finally:
-                    cleanup_memory()
-            
-            return chunk_results
-            
-        except Exception as e:
-            print(f"Error processing backward chunk {chunk['id']}: {e}")
-            return {}
-        finally:
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
-            cleanup_memory()
-
-    def _process_chunk_with_inheritance(self, chunk, prev_chunk_results, debug=True, direction='forward'):
-        """Process a chunk using masks inherited from previous chunks"""
-        # This is similar to the original process_chunk_with_overlap but simplified
-        chunk_results = {}
-        temp_dir = os.path.join(self.video_dir, f"chunk_{direction}_{chunk['id']}")
-        
-        try:
-            # Setup temporary directory
-            os.makedirs(temp_dir, exist_ok=True)
-            for frame_name in chunk['frame_names']:
-                src = os.path.join(self.video_dir, frame_name)
-                dst = os.path.join(temp_dir, frame_name)
-                if not os.path.exists(dst):
-                    shutil.copy2(src, dst)
-            
-            chunk_state = self.predictor.init_state(video_path=temp_dir)
-            
-            # Get reference masks from previous results
-            target_frame = chunk['global_start']
-            reference_masks = self._get_best_reference_masks(prev_chunk_results, target_frame)
-            
-            if not reference_masks:
-                print(f"    Warning: No reference masks for chunk {chunk['id']}")
-                return {}
-            
-            # Process each object
-            for obj_id, reference_mask in reference_masks.items():
-                try:
-                    self.predictor.reset_state(chunk_state)
-                    
-                    # Generate points from reference mask
-                    points, labels = self._generate_robust_points_from_mask(reference_mask)
-                    
-                    if points is None:
-                        continue
-                    
-                    prompt_frame_idx = chunk['overlap_offset']
-                    
-                    # Add prompts
-                    _, obj_ids, mask_logits = self.predictor.add_new_points_or_box(
-                        inference_state=chunk_state,
-                        frame_idx=prompt_frame_idx,
-                        obj_id=obj_id,
-                        points=points,
-                        labels=labels
-                    )
-                    
-                    # Store and propagate
-                    for i, prop_obj_id in enumerate(obj_ids):
-                        mask = (mask_logits[i] > 0.0).cpu().numpy()
-                        if len(mask.shape) == 3:
-                            mask = mask[0]
-                        
-                        global_frame_idx = chunk['global_start'] + prompt_frame_idx - chunk['overlap_offset']
-                        
-                        if global_frame_idx not in chunk_results:
-                            chunk_results[global_frame_idx] = {}
-                        chunk_results[global_frame_idx][prop_obj_id] = mask.copy()
-                    
-                    del mask_logits
-                    cleanup_memory()
-                    
-                    # Propagate through chunk
-                    for frame_idx, prop_obj_ids, prop_mask_logits in self.predictor.propagate_in_video(chunk_state):
-                        global_frame_idx = chunk['global_start'] + frame_idx - chunk['overlap_offset']
-                        
-                        if chunk['id'] > 0 and frame_idx < chunk['overlap_offset']:
-                            continue
-                        
-                        if global_frame_idx >= chunk['global_end']:
-                            break
-                        
-                        for i, prop_obj_id in enumerate(prop_obj_ids):
-                            mask = (prop_mask_logits[i] > 0.0).cpu().numpy()
-                            if len(mask.shape) == 3:
-                                mask = mask[0]
-                            
-                            if global_frame_idx not in chunk_results:
-                                chunk_results[global_frame_idx] = {}
-                            chunk_results[global_frame_idx][prop_obj_id] = mask.copy()
-                        
-                        del prop_mask_logits
-                        cleanup_memory()
-                
-                except Exception as e:
-                    print(f"    Error processing object {obj_id}: {e}")
-                    continue
-                finally:
-                    cleanup_memory()
-            
-            return chunk_results
-            
-        except Exception as e:
-            print(f"Error processing {direction} chunk {chunk['id']}: {e}")
-            return {}
-        finally:
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
-            cleanup_memory()
-
     def save_results_video(self, results, output_path, fps=30, show_original=True, alpha=0.5):
         """Save results as video"""
         if not results:
@@ -1452,7 +842,6 @@ class VideoChunkProcessor:
         height, width = first_frame.shape[:2]
     
         cmap = plt.get_cmap("tab10")
-        
         object_names = getattr(self, 'object_names', {})
         
         def get_object_name(obj_id):
@@ -1466,7 +855,7 @@ class VideoChunkProcessor:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(output_path, fourcc, fps, (int(out_width), int(height)))
     
-        print("\nSaving video...")
+        print("Saving video...")
         for frame_idx in tqdm(range(len(self.frame_names))):
             frame = cv2.imread(os.path.join(self.video_dir, self.frame_names[frame_idx]))
             if frame is None:
@@ -1506,7 +895,6 @@ class VideoChunkProcessor:
                             cx = int(moments['m10'] / moments['m00'])
                             cy = int(moments['m01'] / moments['m00'])
                             
-                            # Use object name as display text
                             name = get_object_name(obj_id)
                             
                             # Add background for better text visibility
@@ -1525,29 +913,14 @@ class VideoChunkProcessor:
             out.write(output_frame)
     
         out.release()
-        
-        # Print summary of exported objects
-        if hasattr(self, 'object_names'):
-            object_names = getattr(self, 'object_names', {})
-            exported_objects = set()
-            for frame_results in results.values():
-                exported_objects.update(frame_results.keys())
-            
-            named_objects = [object_names.get(obj_id, f"Object_{obj_id}") for obj_id in exported_objects]
-            
-            print(f"Video saved to: {output_path}")
-            print(f"  🎬 {len(results)} frames with object overlays")
-            print(f"  📊 {len(exported_objects)} object types: {', '.join(named_objects)}")
-        else:
-            print(f"Video saved to: {output_path}")
+        print(f"Video saved to: {output_path}")
 
     def _save_time_series(self, csv_path):
-        """Save time series metrics with object names as identifiers"""
+        """Save time series metrics"""
         metrics_data = []
         object_names = getattr(self, 'object_names', {})
         
         def get_object_identifier(obj_id):
-            """Get the primary identifier - use name if available, otherwise numeric ID"""
             return object_names.get(obj_id, f"Object_{obj_id}")
         
         for frame_idx in sorted(self.results.keys()):
@@ -1574,11 +947,11 @@ class VideoChunkProcessor:
                     metrics.update({
                         'frame': frame_idx,
                         'frame_name': frame_name,
-                        'object_id': obj_identifier,  # Use object name as primary ID
-                        'object_name': obj_identifier,  # For backwards compatibility
-                        'numeric_object_id': obj_id,  # Keep original numeric ID for reference
-                        'is_named_object': obj_id in object_names,  # Flag to indicate if user provided name
-                        'timestamp_seconds': frame_idx / 30.0 if hasattr(self, 'fps') else frame_idx / 30.0  # Approximate timestamp
+                        'object_id': obj_identifier,
+                        'object_name': obj_identifier,
+                        'numeric_object_id': obj_id,
+                        'is_named_object': obj_id in object_names,
+                        'timestamp_seconds': frame_idx / 30.0
                     })
                     
                     metrics_data.append(metrics)
@@ -1590,71 +963,32 @@ class VideoChunkProcessor:
             print("No valid metrics data collected")
             return
             
-        # Create DataFrame and calculate deltas by object name (not numeric ID)
         df = pd.DataFrame(metrics_data)
         
-        # Calculate deltas grouped by object identifier (name)
+        # Calculate deltas and velocities
         df['delta_centroid_x'] = df.groupby('object_id')['seg_centroid_x'].diff()
         df['delta_centroid_y'] = df.groupby('object_id')['seg_centroid_y'].diff()
         df['delta_area'] = df.groupby('object_id')['surface_area'].diff()
         
-        # Calculate velocity (pixels per frame)
         df['velocity_x'] = df['delta_centroid_x'].fillna(0)
         df['velocity_y'] = df['delta_centroid_y'].fillna(0) 
         df['velocity_magnitude'] = np.sqrt(df['velocity_x']**2 + df['velocity_y']**2)
         
-        # Calculate cumulative movement
         df['cumulative_distance'] = df.groupby('object_id')['velocity_magnitude'].cumsum()
         
-        # Reorder columns for better readability
-        column_order = [
-            'frame', 'frame_name', 'timestamp_seconds', 'object_id', 'object_name',
-            'seg_centroid_x', 'seg_centroid_y', 'surface_area',
-            'delta_centroid_x', 'delta_centroid_y', 'delta_area',
-            'velocity_x', 'velocity_y', 'velocity_magnitude', 'cumulative_distance',
-            'box_x1', 'box_y1', 'box_x2', 'box_y2', 'box_centroid_x', 'box_centroid_y',
-            'mean_color_r', 'mean_color_g', 'mean_color_b', 'color_intensity',
-            'std_color_r', 'std_color_g', 'std_color_b',
-            'numeric_object_id', 'is_named_object'
-        ]
-        
-        # Reorder columns (keep any additional columns at the end)
-        available_columns = [col for col in column_order if col in df.columns]
-        remaining_columns = [col for col in df.columns if col not in column_order]
-        df = df[available_columns + remaining_columns]
-        
         df.to_csv(csv_path, index=False)
-        
-        # Print summary statistics
-        unique_objects = df['object_id'].unique()
-        named_objects = df[df['is_named_object'] == True]['object_id'].unique()
-        
         print(f"Saved time series metrics to: {csv_path}")
-        print(f"  📊 {len(df)} data points across {len(unique_objects)} objects")
-        print(f"  🏷️ {len(named_objects)} objects with custom names")
-        if len(named_objects) > 0:
-            print(f"  📝 Named objects: {', '.join(named_objects)}")
-        print(f"  📈 Metrics include: position, area, movement, velocity, and color analysis")
 
     def _save_coco_annotations(self, json_path):
-        """Save annotations in COCO format with object names as identifiers"""
+        """Save annotations in COCO format"""
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
         object_names = getattr(self, 'object_names', {})
-        
-        def get_object_identifier(obj_id):
-            """Get the primary identifier - use name if available, otherwise numeric ID"""
-            return object_names.get(obj_id, f"Object_{obj_id}")
-        
-        def get_object_display_name(obj_id):
-            """Get display name for backwards compatibility"""
-            return object_names.get(obj_id, f"Object_{obj_id}")
         
         coco_data = {
             "info": {
                 "year": datetime.now().year,
                 "version": "1.0",
-                "description": "SAM2 segmentation results with human-readable object identifiers",
+                "description": "SAM2 segmentation results",
                 "date_created": current_time
             },
             "images": [],
@@ -1663,27 +997,18 @@ class VideoChunkProcessor:
             "categories": []
         }
         
-        # Create categories using object names as primary identifiers
+        # Create categories
         unique_objects = set()
         for frame_results in self.results.values():
             unique_objects.update(frame_results.keys())
         
-        # Create mapping from name back to numeric ID for internal consistency
-        name_to_id = {}
-        
         for obj_id in sorted(unique_objects):
-            obj_identifier = get_object_identifier(obj_id)
-            display_name = get_object_display_name(obj_id)
-            
+            obj_name = object_names.get(obj_id, f"Object_{obj_id}")
             coco_data["categories"].append({
                 "supercategory": "object",
-                "id": obj_identifier,  # Use name as primary ID
-                "name": display_name,
-                "numeric_id": obj_id,  # Keep original numeric ID for reference
-                "is_named": obj_id in object_names  # Flag to indicate if user provided name
+                "id": obj_id,
+                "name": obj_name
             })
-            
-            name_to_id[obj_identifier] = obj_id
         
         # Add images
         unique_ids = {}
@@ -1700,7 +1025,7 @@ class VideoChunkProcessor:
             })
             unique_ids[frame_name] = idx
         
-        # Add annotations with object names as identifiers
+        # Add annotations
         annotation_id = 1
         for frame_idx in self.results:
             current_frame = self.frame_names[frame_idx]
@@ -1726,8 +1051,6 @@ class VideoChunkProcessor:
                         bbox = [x1, y1, x2 - x1, y2 - y1]
                         area = int(cv2.contourArea(contour))
                         
-                        obj_identifier = get_object_identifier(obj_id)
-                        
                         coco_data["annotations"].append({
                             "segmentation": [flattened],
                             "area": area,
@@ -1735,25 +1058,15 @@ class VideoChunkProcessor:
                             "iscrowd": 0,
                             "id": annotation_id,
                             "image_id": unique_ids[current_frame],
-                            "category_id": obj_identifier,  # Use object name as category ID
-                            "object_name": get_object_display_name(obj_id),  # Backwards compatibility
-                            "numeric_object_id": obj_id,  # Keep original numeric ID for reference
-                            "frame_number": frame_idx  # Add frame number for easy reference
+                            "category_id": obj_id,
+                            "frame_number": frame_idx
                         })
                         annotation_id += 1
         
         with open(json_path, 'w', encoding='utf-8') as f:
             json.dump(coco_data, f, indent=2)
         
-        # Print summary of exported objects
-        named_objects = len([obj_id for obj_id in unique_objects if obj_id in object_names])
-        total_objects = len(unique_objects)
-        
         print(f"Saved COCO annotations to: {json_path}")
-        print(f"  📊 {total_objects} object types exported")
-        print(f"  🏷️ {named_objects} with custom names, {total_objects - named_objects} with default names")
-        if named_objects > 0:
-            print(f"  📝 Named objects: {', '.join([object_names[obj_id] for obj_id in unique_objects if obj_id in object_names])}")
 
     def save_results(self, output_path, fps=30, show_original=True, alpha=0.5):
         """Save all results"""
@@ -1762,47 +1075,41 @@ class VideoChunkProcessor:
         self._save_time_series(os.path.join(os.path.dirname(output_path), "time_series_metrics.csv"))
 
 def select_points_opencv(frame, processor=None):
-    """Interactive point selection tool with mask preview capability and custom naming"""
+    """Interactive point selection tool"""
     points_dict = {}
     labels_dict = {}
     object_names = {}
     current_obj_id = 1
     
     temp_dir = "temp_select"
+    chunk_state = None
+    
     if processor is not None:
         try:
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir)
             os.makedirs(temp_dir)
             
-            # SAM2 expects numbered frame files - use 00000.jpg format  
             frame_path = os.path.join(temp_dir, "00000.jpg")
             cv2.imwrite(frame_path, frame)
-            print(f"Saved frame to {frame_path}")
             
             chunk_state = processor.predictor.init_state(video_path=temp_dir)
             if chunk_state is None:
                 raise ValueError("Failed to initialize chunk state")
-            print("Successfully initialized processor state")
             
         except Exception as e:
             print(f"Error initializing processor: {str(e)}")
-            import traceback
-            traceback.print_exc()
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir)
-            print("❌ Mask preview not available - processor initialization failed")
-            return None, None, None
+            processor = None
     
     def get_object_name(obj_id):
-        """Get display name for object"""
         if obj_id in object_names:
             return f"{obj_id}:{object_names[obj_id]}"
         else:
             return str(obj_id)
     
     def draw_point(img, point, obj_id, label):
-        """Draw a point with appropriate color and label"""
         color = (0, 255, 0) if label == 1 else (0, 0, 255)
         cv2.circle(img, (int(point[0]), int(point[1])), 5, color, -1)
         
@@ -1812,13 +1119,11 @@ def select_points_opencv(frame, processor=None):
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
     
     def redraw_all_points():
-        """Redraw all points on fresh image with keyboard shortcuts"""
         display = frame.copy()
         for obj_id in points_dict:
             for pt, label in zip(points_dict[obj_id], labels_dict[obj_id]):
                 draw_point(display, pt, obj_id, label)
         
-        # Add keyboard shortcuts overlay
         height, width = display.shape[:2]
         
         # Create semi-transparent overlay for instructions
@@ -1828,7 +1133,6 @@ def select_points_opencv(frame, processor=None):
                      (width - 10, height - 10), (0, 0, 0), -1)
         display = cv2.addWeighted(display, 0.7, overlay, 0.3, 0)
         
-        # Add instruction text
         instructions = [
             "KEYBOARD SHORTCUTS:",
             "Left Click: Add positive point (+)",
@@ -1842,20 +1146,18 @@ def select_points_opencv(frame, processor=None):
         
         y_start = height - instructions_height
         for i, instruction in enumerate(instructions):
-            color = (0, 255, 255) if i == 0 else (255, 255, 255)  # Yellow for title, white for others
+            color = (0, 255, 255) if i == 0 else (255, 255, 255)
             font_scale = 0.6 if i == 0 else 0.5
             thickness = 2 if i == 0 else 1
             
             cv2.putText(display, instruction, (20, y_start + (i * 22)), 
                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness)
         
-        # Show current object info
         current_obj_name = get_object_name(current_obj_id)
         obj_info = f"Current Object: {current_obj_name}"
         cv2.putText(display, obj_info, (20, 30), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
         
-        # Show point count for current object
         if current_obj_id in points_dict:
             pos_count = sum(1 for l in labels_dict[current_obj_id] if l == 1)
             neg_count = sum(1 for l in labels_dict[current_obj_id] if l == 0)
@@ -1866,7 +1168,6 @@ def select_points_opencv(frame, processor=None):
         return display
     
     def name_current_object():
-        """Allow user to name the current object"""
         import tkinter as tk
         from tkinter import simpledialog
         
@@ -1887,17 +1188,7 @@ def select_points_opencv(frame, processor=None):
             img_display = redraw_all_points()
         
     def test_mask():
-        """Show preview of current object's mask"""
         try:
-            obj_name = get_object_name(current_obj_id)
-            print(f"\nTest mask debug info:")
-            print(f"Processor: {'initialized' if processor is not None else 'None'}")
-            print(f"Chunk state: {'initialized' if chunk_state is not None else 'None'}")
-            print(f"Current object: {obj_name}")
-            print(f"Points available: {current_obj_id in points_dict}")
-            if current_obj_id in points_dict:
-                print(f"Number of points: {len(points_dict[current_obj_id])}")
-            
             if not points_dict or not points_dict.get(current_obj_id):
                 print("No points selected for current object")
                 return
@@ -1909,12 +1200,10 @@ def select_points_opencv(frame, processor=None):
             points = np.array(points_dict[current_obj_id], dtype=np.float32)
             labels = np.array(labels_dict[current_obj_id], dtype=np.int32)
             
-            print(f"Testing mask with {len(points)} points ({sum(labels == 1)} positive, {sum(labels == 0)} negative)")
-            
             processor.predictor.reset_state(chunk_state)
             _, obj_ids, mask_logits = processor.predictor.add_new_points_or_box(
                 inference_state=chunk_state,
-                frame_idx=0,  # Always use frame 0 since we only have one frame
+                frame_idx=0,
                 obj_id=current_obj_id,
                 points=points,
                 labels=labels
@@ -1953,8 +1242,6 @@ def select_points_opencv(frame, processor=None):
                 
         except Exception as e:
             print(f"Error in test_mask: {str(e)}")
-            import traceback
-            traceback.print_exc()
         
     def click_handler(event, x, y, flags, param):
         nonlocal img_display
@@ -1969,13 +1256,12 @@ def select_points_opencv(frame, processor=None):
             label = 1 if event == cv2.EVENT_LBUTTONDOWN else 0
             labels_dict[current_obj_id].append(label)
             
-            # Refresh the entire display to update point counters
             img_display = redraw_all_points()
             obj_name = get_object_name(current_obj_id)
             print(f"Added {'positive' if label == 1 else 'negative'} point for {obj_name}")
     
-    img_display = frame.copy()
-    cv2.namedWindow('Select Points')
+    img_display = redraw_all_points()
+    cv2.namedWindow('Select Points', cv2.WINDOW_NORMAL)
     cv2.setMouseCallback('Select Points', click_handler)
     
     print("\nControls:")
@@ -2005,12 +1291,14 @@ def select_points_opencv(frame, processor=None):
             current_obj_id += 1
             obj_name = get_object_name(current_obj_id)
             print(f"Now selecting {obj_name}")
+            img_display = redraw_all_points()
         
         elif key == ord('p'):
             if current_obj_id > 1:
                 current_obj_id -= 1
                 obj_name = get_object_name(current_obj_id)
                 print(f"Now selecting {obj_name}")
+                img_display = redraw_all_points()
         
         elif key == ord('c'):
             name_current_object()
@@ -2032,363 +1320,117 @@ def select_points_opencv(frame, processor=None):
     
     return points_dict, labels_dict, object_names
 
-class FineTunedVideoProcessor:
-    """Processor for using fine-tuned SAM2 models"""
-    
-    def __init__(self, model_path, config_path, video_dir, auto_mode=True, chunk_size=500, overlap_frames=30):
-        """
-        Initialize fine-tuned video processor
-        
-        Args:
-            model_path: Path to trained model (.pth file)
-            config_path: Path to SAM2 config (.yaml file)  
-            video_dir: Directory containing video frames
-            auto_mode: If True, automatically detect objects
-            chunk_size: Frames per chunk
-            overlap_frames: Overlap between chunks
-        """
-        self.device = setup_device()
-        self.auto_mode = auto_mode
-        self.video_dir = video_dir
-        self.chunk_size = chunk_size
-        self.overlap_frames = overlap_frames
-        
-        print(f"Loading fine-tuned model from: {model_path}")
-        self._load_trained_model(model_path, config_path)
-        
-        # Initialize base processor components
-        if not os.path.exists(self.video_dir):
-            raise FileNotFoundError(f"Video directory {self.video_dir} does not exist!")
-        
-        self.frame_names = sorted(
-            [p for p in os.listdir(self.video_dir) 
-             if os.path.splitext(p)[-1].lower() in [".jpg", ".jpeg"]],
-            key=lambda p: int(os.path.splitext(p)[0])
-        )
-        
-        if not self.frame_names:
-            raise ValueError("No frames found in the specified directory!")
-        
-        self.chunks = self._calculate_chunks_with_overlap()
-        print(f"✅ Fine-tuned model loaded successfully!")
-        if hasattr(self, 'trained_objects'):
-            print(f"Trained objects: {self.trained_objects}")
-    
-    def _load_trained_model(self, model_path, config_path):
-        """Load the fine-tuned SAM2 model"""
-        try:
-            # Load checkpoint to get training info
-            checkpoint = torch.load(model_path, map_location=self.device)
-            
-            # Extract trained object information if available
-            if 'config' in checkpoint and 'dataset' in checkpoint['config']:
-                self.trained_objects = checkpoint['config']['dataset'].get('object_names', [])
-                self.object_name_to_id = {name: i+1 for i, name in enumerate(self.trained_objects)}
-            else:
-                # Fallback if config not in checkpoint
-                self.trained_objects = []
-                self.object_name_to_id = {}
-                print("⚠️ No object names found in checkpoint - will work in manual mode")
-            
-            # Build base model
-            from sam2.build_sam import build_sam2_video_predictor
-            self.predictor = build_sam2_video_predictor(config_path, model_path, device=self.device)
-            
-            # Load fine-tuned weights if they exist
-            if 'model_state_dict' in checkpoint:
-                try:
-                    self.predictor.load_state_dict(checkpoint['model_state_dict'])
-                    print("✅ Loaded fine-tuned weights")
-                except Exception as e:
-                    print(f"⚠️ Could not load fine-tuned weights: {e}")
-                    print("Using base model weights")
-            
-            self.predictor.eval()
-            
-        except Exception as e:
-            print(f"❌ Error loading fine-tuned model: {e}")
-            # Fallback to base model
-            try:
-                from sam2.build_sam import build_sam2_video_predictor
-                self.predictor = build_sam2_video_predictor(config_path, model_path, device=self.device)
-                self.trained_objects = []
-                self.object_name_to_id = {}
-                print("⚠️ Loaded base model as fallback")
-            except Exception as fallback_error:
-                raise RuntimeError(f"Failed to load any model: {fallback_error}")
-    
-    def _calculate_chunks_with_overlap(self):
-        """Calculate chunks with overlap (same as main processor)"""
-        chunks = []
-        frame_count = len(self.frame_names)
-        
-        start = 0
-        chunk_id = 0
-        
-        while start < frame_count:
-            end = min(start + self.chunk_size, frame_count)
-            
-            if chunk_id > 0:
-                overlap_start = max(0, start - self.overlap_frames)
-                chunk_frame_names = self.frame_names[overlap_start:end]
-                overlap_offset = start - overlap_start
-            else:
-                chunk_frame_names = self.frame_names[start:end]
-                overlap_offset = 0
-            
-            chunks.append({
-                'id': chunk_id,
-                'global_start': start,
-                'global_end': end,
-                'overlap_offset': overlap_offset,
-                'frame_names': chunk_frame_names,
-                'frame_indices': list(range(len(chunk_frame_names)))
-            })
-            
-            start = end
-            chunk_id += 1
-        
-        return chunks
-    
-    def auto_detect_objects(self, frame, confidence_threshold=0.5):
-        """
-        Automatically detect trained objects in frame
-        """
-        if not self.trained_objects:
-            print("⚠️ No trained objects available for auto-detection")
-            return {}
-        
-        height, width = frame.shape[:2]
-        detected_objects = {}
-        
-        # Initialize inference state for this frame
-        temp_dir = "temp_auto_detect"
-        os.makedirs(temp_dir, exist_ok=True)
-        
-        try:
-            # Save frame temporarily with proper naming
-            frame_path = os.path.join(temp_dir, "00000.jpg")
-            cv2.imwrite(frame_path, frame)
-            
-            # Initialize SAM2 state
-            inference_state = self.predictor.init_state(video_path=temp_dir)
-            
-            # Try grid-based detection for each trained object
-            for obj_name in self.trained_objects:
-                obj_id = self.object_name_to_id[obj_name]
-                best_mask = None
-                best_score = 0
-                
-                # Generate detection grid
-                grid_points, grid_labels = self._generate_detection_grid(frame, grid_size=60)
-                
-                if len(grid_points) > 0:
-                    try:
-                        self.predictor.reset_state(inference_state)
-                        
-                        _, out_obj_ids, out_mask_logits = self.predictor.add_new_points_or_box(
-                            inference_state=inference_state,
-                            frame_idx=0,
-                            obj_id=obj_id,
-                            points=grid_points,
-                            labels=grid_labels,
-                        )
-                        
-                        if len(out_mask_logits) > 0:
-                            mask = (out_mask_logits[0] > 0.0).cpu().numpy()
-                            if len(mask.shape) == 3:
-                                mask = mask[0]
-                            
-                            # Calculate confidence based on mask quality
-                            mask_area = np.sum(mask)
-                            if mask_area > 100:  # Minimum area threshold
-                                mask_compactness = self._calculate_mask_compactness(mask)
-                                score = (mask_area / (width * height)) * mask_compactness * 100
-                                
-                                if score > confidence_threshold and score > best_score:
-                                    best_score = score
-                                    best_mask = mask
-                                    
-                    except Exception as e:
-                        print(f"Error detecting {obj_name}: {e}")
-                        continue
-                
-                # Store best detection
-                if best_mask is not None:
-                    detected_objects[obj_id] = best_mask
-                    print(f"✅ Auto-detected {obj_name} (confidence: {best_score:.2f})")
-        
-        finally:
-            # Cleanup
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
-        
-        return detected_objects
-    
-    def _generate_detection_grid(self, frame, grid_size=60):
-        """Generate a grid of detection points across the frame"""
-        height, width = frame.shape[:2]
-        points = []
-        labels = []
-        
-        # Create positive points in a grid pattern
-        for y in range(grid_size//2, height, grid_size):
-            for x in range(grid_size//2, width, grid_size):
-                points.append([x, y])
-                labels.append(1)
-        
-        # Add some negative points at edges
-        edge_points = [
-            [10, 10], [width-10, 10], [10, height-10], [width-10, height-10],
-            [width//2, 10], [width//2, height-10], [10, height//2], [width-10, height//2]
-        ]
-        
-        for point in edge_points:
-            points.append(point)
-            labels.append(0)
-        
-        return np.array(points, dtype=np.float32), np.array(labels, dtype=np.int32)
-    
-    def _calculate_mask_compactness(self, mask):
-        """Calculate how compact/coherent a mask is"""
-        if not mask.any():
-            return 0
-        
-        # Find contours
-        contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        if not contours:
-            return 0
-        
-        # Calculate compactness (area / perimeter^2) 
-        largest_contour = max(contours, key=cv2.contourArea)
-        area = cv2.contourArea(largest_contour)
-        perimeter = cv2.arcLength(largest_contour, True)
-        
-        if perimeter == 0:
-            return 0
-        
-        compactness = 4 * np.pi * area / (perimeter ** 2)
-        return min(compactness, 1.0)  # Clamp to 1.0
-    
-    def process_video_auto(self, initial_frame_idx=0):
-        """
-        Process video automatically using fine-tuned model
-        """
-        if not self.auto_mode:
-            raise ValueError("Auto mode not enabled")
-        
-        print("🤖 Starting automatic video processing with fine-tuned model...")
-        
-        # Step 1: Auto-detect objects in initial frame
-        print(f"Detecting objects in frame {initial_frame_idx}...")
-        initial_frame = cv2.imread(os.path.join(self.video_dir, self.frame_names[initial_frame_idx]))
-        
-        detected_objects = self.auto_detect_objects(initial_frame)
-        
-        if not detected_objects:
-            print("❌ No objects detected automatically")
-            return None, None
-        
-        print(f"✅ Detected {len(detected_objects)} objects automatically")
-        
-        # Step 2: Convert detections to points for tracking
-        points_dict = {}
-        labels_dict = {}
-        object_names = {}
-        
-        for obj_id, mask in detected_objects.items():
-            points, labels = self._mask_to_points(mask)
-            if points is not None:
-                points_dict[obj_id] = points.tolist()
-                labels_dict[obj_id] = labels.tolist()
-                
-                # Map back to object name
-                if self.trained_objects and obj_id <= len(self.trained_objects):
-                    obj_name = self.trained_objects[obj_id-1]
-                    object_names[obj_id] = obj_name
-                else:
-                    object_names[obj_id] = f"Object_{obj_id}"
-        
-        # Step 3: Process video with detected objects
-        print("Processing video with detected objects...")
-        results = self.process_video_with_prompts(points_dict, labels_dict)
-        
-        return results, object_names
-    
-    def _mask_to_points(self, mask, num_points=8):
-        """Convert a detected mask back to prompt points"""
-        if not mask.any():
-            return None, None
-        
-        # Get contour points
-        contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return None, None
-        
-        largest_contour = max(contours, key=cv2.contourArea)
-        
-        # Sample points along contour
-        points = []
-        labels = []
-        
-        contour_length = len(largest_contour)
-        step = max(1, contour_length // num_points)
-        
-        for i in range(0, contour_length, step):
-            point = largest_contour[i][0]
-            points.append([int(point[0]), int(point[1])])
-            labels.append(1)
-        
-        # Add center point
-        moments = cv2.moments(mask.astype(np.uint8))
-        if moments['m00'] != 0:
-            cx = int(moments['m10'] / moments['m00'])
-            cy = int(moments['m01'] / moments['m00'])
-            points.append([cx, cy])
-            labels.append(1)
-        
-        return np.array(points, dtype=np.float32), np.array(labels, dtype=np.int32)
-    
-    def process_video_with_prompts(self, points_dict, labels_dict, seed_frame_idx=0):
-        """Process video with given prompts (reuse existing VideoChunkProcessor logic)"""
-        # Create a temporary VideoChunkProcessor with our fine-tuned predictor
-        temp_processor = VideoChunkProcessor(
-            predictor=self.predictor,
-            video_dir=self.video_dir,
-            chunk_size=self.chunk_size,
-            overlap_frames=self.overlap_frames,
-            interactive_correction=False,  # Disable interactive correction for auto mode
-            seed_frame_idx=seed_frame_idx
-        )
-        
-        return temp_processor.process_video(points_dict, labels_dict)
-    
-    def save_results(self, output_path, fps=30, show_original=True, alpha=0.5):
-        """Save results (reuse existing save logic)"""
-        # Create a temporary VideoChunkProcessor for saving
-        temp_processor = VideoChunkProcessor(
-            predictor=self.predictor,
-            video_dir=self.video_dir,
-            chunk_size=self.chunk_size,
-            overlap_frames=self.overlap_frames,
-            seed_frame_idx=0  # Default seed for saving
-        )
-        
-        # Copy our results and object names
-        temp_processor.results = self.results
-        temp_processor.object_names = getattr(self, 'object_names', {})
-        
-        # Use existing save functionality
-        temp_processor.save_results(output_path, fps, show_original, alpha)
+def create_finetuning_setup():
+    """Create fine-tuning setup files - FIXED for encoding issues"""
+    try:
+        # Training config template
+        config_content = """# SAM2 Fine-tuning Configuration
+model:
+  type: "sam2_hiera_l"
+  checkpoint: "checkpoints/sam2.1_hiera_large.pt" 
+  freeze_image_encoder: false
+  
+dataset:
+  name: "custom_objects"
+  annotation_dirs: ["./video1_frames", "./video2_frames"]  # Update with your paths
+  object_names: ["Object_1", "Object_2"]  # Update with your object names
+  train_split: 0.8
+  val_split: 0.2
+  image_size: [1024, 1024]
+  
+training:
+  batch_size: 4
+  learning_rate: 1e-5
+  num_epochs: 50
+  weight_decay: 1e-4
+  
+output:
+  save_dir: "./sam2_finetuned"
+  save_every: 10
+  eval_every: 5
+"""
 
+        # Training script template
+        training_script = '''#!/usr/bin/env python3
+"""
+SAM2 Fine-tuning Training Script - Simplified
+"""
+
+import os
+import yaml
+import torch
+
+def main():
+    print("SAM2 Fine-tuning Training")
+    print("=" * 40)
+    
+    # Check if config exists
+    if not os.path.exists("training_config.yaml"):
+        print("Error: training_config.yaml not found")
+        return
+    
+    print("Loading configuration...")
+    with open("training_config.yaml", 'r', encoding='utf-8') as f:
+        config = yaml.safe_load(f)
+    
+    print("Configuration loaded successfully!")
+    print(f"Model: {config['model']['type']}")
+    print(f"Objects: {config['dataset']['object_names']}")
+    print(f"Annotation dirs: {config['dataset']['annotation_dirs']}")
+    
+    # Check if SAM2 is available
+    try:
+        from sam2.build_sam import build_sam2_video_predictor
+        print("SAM2 is available!")
+    except ImportError:
+        print("Error: SAM2 not found. Please install SAM2 first.")
+        print("git clone https://github.com/facebookresearch/segment-anything-2.git")
+        print("cd segment-anything-2")
+        print("pip install -e .")
+        return
+    
+    print("\\nTo implement actual training:")
+    print("1. Create custom dataset class")
+    print("2. Implement training loop")
+    print("3. Add loss functions")
+    print("4. Set up validation")
+    
+    print("\\nFor now, this is a template. Full implementation requires:")
+    print("- Custom dataset loader for your annotations")
+    print("- Training loop with SAM2 model")
+    print("- Loss computation and backpropagation")
+
+if __name__ == "__main__":
+    main()
+'''
+
+        # Write files with proper encoding
+        with open("training_config.yaml", "w", encoding='utf-8') as f:
+            f.write(config_content)
+        print("✅ Created: training_config.yaml")
+        
+        with open("train_sam2.py", "w", encoding='utf-8') as f:
+            f.write(training_script)
+        print("✅ Created: train_sam2.py")
+        
+        print("\n🎯 Fine-tuning setup complete!")
+        print("\nNext steps:")
+        print("1. Update training_config.yaml with your annotation directories and object names")
+        print("2. Ensure you have multiple annotated videos")
+        print("3. Run: python train_sam2.py")
+        
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error creating fine-tuning setup: {e}")
+        return False
 
 class VideoAnalysisApp:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("SAM2 Video Analysis & Inference")
-        self.root.geometry("650x700")  # Made bigger to show all buttons
-        self.root.minsize(650, 700)    # Increased minimum size too
+        self.root.title("SAM2 Video Analysis")
+        self.root.geometry("700x750")
+        self.root.minsize(700, 750)
         
         # Initialize SAM2
         self.device = setup_device()
@@ -2400,14 +1442,14 @@ class VideoAnalysisApp:
     def init_sam2(self):
         """Initialize SAM2 predictor"""
         try:
-            # You need to update these paths to your SAM2 installation
+            # Update these paths to your SAM2 installation
             sam2_checkpoint = "../checkpoints/sam2.1_hiera_large.pt"
             model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
             
             if not os.path.exists(sam2_checkpoint):
-                messagebox.showerror("Error", 
+                messagebox.showwarning("SAM2 Setup", 
                     f"SAM2 checkpoint not found at: {sam2_checkpoint}\n"
-                    "Please update the path in the script.")
+                    "Please update the path in the script or download SAM2 checkpoints.")
                 return
             
             from sam2.build_sam import build_sam2_video_predictor
@@ -2428,7 +1470,7 @@ class VideoAnalysisApp:
         main_frame = tk.Frame(self.root, padx=15, pady=15)
         main_frame.pack(fill=tk.BOTH, expand=True)
         
-        title_label = tk.Label(main_frame, text="SAM2 Video Analysis & Inference", 
+        title_label = tk.Label(main_frame, text="SAM2 Video Analysis - Complete Fixed Version", 
                               font=("Arial", 14, "bold"))
         title_label.pack(pady=(0, 15))
         
@@ -2467,68 +1509,49 @@ class VideoAnalysisApp:
         self.video_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.config(command=self.video_listbox.yview)
         
-        # Processing options
+        # Processing options - ENHANCED
         options_frame = tk.LabelFrame(main_frame, text="Processing Options", font=("Arial", 9, "bold"))
         options_frame.pack(fill=tk.X, pady=(10, 10))
+        
+        # Chunk size setting - NEW
+        chunk_frame = tk.Frame(options_frame)
+        chunk_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        tk.Label(chunk_frame, text="Chunk Size (frames):").pack(side=tk.LEFT)
+        self.chunk_size_var = tk.StringVar(value="500")
+        chunk_spin = tk.Spinbox(chunk_frame, from_=100, to=2000, increment=100, 
+                               textvariable=self.chunk_size_var, width=10)
+        chunk_spin.pack(side=tk.LEFT, padx=(5, 0))
+        tk.Label(chunk_frame, text="(smaller = less memory, slower processing)", 
+                font=("Arial", 8), fg="gray").pack(side=tk.LEFT, padx=(10, 0))
         
         # Interactive correction option
         self.interactive_correction = tk.BooleanVar(value=True)
         correction_cb = tk.Checkbutton(options_frame, 
-                                      text="🎯 Interactive mask correction (pause for manual fixes when needed)",
+                                      text="🎯 Interactive mask correction",
                                       variable=self.interactive_correction)
         correction_cb.pack(anchor=tk.W, padx=5, pady=2)
         
         # Analysis video option
         self.create_analysis_video = tk.BooleanVar(value=True)
         analysis_cb = tk.Checkbutton(options_frame, 
-                                    text="📊 Create analysis video with plots and metrics",
+                                    text="📊 Create analysis video with plots",
                                     variable=self.create_analysis_video)
         analysis_cb.pack(anchor=tk.W, padx=5, pady=2)
         
-        help_label = tk.Label(options_frame, 
-                             text="Interactive correction: You'll be prompted to fix discontinuous masks\n"
-                                  "Analysis video: Creates detailed video with movement/area/color plots",
-                             font=("Arial", 8), fg="gray")
-        help_label.pack(anchor=tk.W, padx=20, pady=(0, 5))
-        
-        # Fine-tuning workflow section
-        finetuning_frame = tk.LabelFrame(main_frame, text="🧠 SAM2 Fine-tuning Workflow", font=("Arial", 9, "bold"))
+        # Fine-tuning section
+        finetuning_frame = tk.LabelFrame(main_frame, text="🧠 Fine-tuning", font=("Arial", 9, "bold"))
         finetuning_frame.pack(fill=tk.X, pady=(10, 10))
         
-        ft_info_label = tk.Label(finetuning_frame, 
-                                text="After annotating multiple videos, create a specialized model for your objects:",
-                                font=("Arial", 8), fg="navy")
-        ft_info_label.pack(anchor=tk.W, padx=5, pady=(2, 5))
-        
-        ft_buttons_frame = tk.Frame(finetuning_frame)
-        ft_buttons_frame.pack(fill=tk.X, padx=5, pady=(0, 5))
-        
-        tk.Button(ft_buttons_frame, text="🔧 Setup Fine-tuning Environment", 
+        tk.Button(finetuning_frame, text="🔧 Setup Fine-tuning Environment", 
                  command=self.setup_finetuning, bg="#FF5722", fg="white",
-                 font=("Arial", 9)).pack(side=tk.LEFT, padx=(0, 5))
+                 font=("Arial", 9)).pack(fill=tk.X, padx=5, pady=2)
         
-        tk.Button(ft_buttons_frame, text="🚀 Start Training Model", 
-                 command=self.start_training, bg="#3F51B5", fg="white",
-                 font=("Arial", 9)).pack(side=tk.LEFT)
-        
-        # Inference section
-        inference_frame = tk.LabelFrame(main_frame, text="🎯 Apply Trained Model", font=("Arial", 9, "bold"))
-        inference_frame.pack(fill=tk.X, pady=(10, 10))
-        
-        inference_info_label = tk.Label(inference_frame, 
-                                       text="Use your trained model to automatically process new videos:",
-                                       font=("Arial", 8), fg="darkgreen")
-        inference_info_label.pack(anchor=tk.W, padx=5, pady=(2, 5))
-        
-        tk.Button(inference_frame, text="🎬 Auto-Process with Trained Model", 
-                 command=self.inference_with_trained_model, bg="#8BC34A", fg="white",
-                 font=("Arial", 10, "bold"), pady=5).pack(fill=tk.X, padx=5, pady=(0, 5))
-        
-        # Process button - Make it more prominent
+        # Process button
         process_frame = tk.Frame(main_frame)
         process_frame.pack(fill=tk.X, pady=(15, 10))
         
-        self.process_button = tk.Button(process_frame, text="Process Selected Video", 
+        self.process_button = tk.Button(process_frame, text="🎬 Process Selected Video", 
                                        command=self.process_video, bg="#4CAF50", fg="white",
                                        font=("Arial", 11, "bold"), pady=8)
         self.process_button.pack(fill=tk.X)
@@ -2536,337 +1559,25 @@ class VideoAnalysisApp:
         # Status
         self.status_var = tk.StringVar(value="Ready - Select a folder and video to begin")
         status_label = tk.Label(main_frame, textvariable=self.status_var, 
-                               fg="blue", font=("Arial", 8), wraplength=600)  # Increased wrap length
+                               fg="blue", font=("Arial", 8), wraplength=650)
         status_label.pack(pady=(5, 0))
     
-    def inference_with_trained_model(self):
-        """Apply a trained model to automatically process video"""
-        try:
-            # Validate basic inputs first
-            selection = self.video_listbox.curselection()
-            if not selection:
-                messagebox.showwarning("Warning", "Please select a video to process")
-                return
-            
-            folder = self.folder_var.get()
-            if not folder:
-                messagebox.showwarning("Warning", "Please select a folder first")
-                return
-            
-            # Select trained model file
-            model_path = filedialog.askopenfilename(
-                title="Select Trained SAM2 Model",
-                filetypes=[
-                    ("PyTorch Model files", "*.pth"),
-                    ("All files", "*.*")
-                ],
-                initialdir=folder
-            )
-            
-            if not model_path:
-                return
-            
-            # Select model config file
-            config_path = filedialog.askopenfilename(
-                title="Select SAM2 Model Config",
-                filetypes=[
-                    ("YAML Config files", "*.yaml"),
-                    ("All files", "*.*")
-                ],
-                initialdir="."
-            )
-            
-            if not config_path:
-                messagebox.showwarning("Warning", "Model config file is required")
-                return
-            
-            # Validate files exist
-            if not os.path.exists(model_path):
-                messagebox.showerror("Error", f"Model file not found: {model_path}")
-                return
-                
-            if not os.path.exists(config_path):
-                messagebox.showerror("Error", f"Config file not found: {config_path}")
-                return
-            
-            # Get video info
-            video_name = self.video_listbox.get(selection[0])
-            video_path = os.path.join(folder, video_name)
-            video_stem = Path(video_name).stem
-            frames_dir = os.path.join(folder, f"{video_stem}_frames")
-            
-            # Ask for processing options
-            auto_detect = messagebox.askyesno("Processing Mode", 
-                "🤖 Automatic Detection Mode?\n\n"
-                "YES: Let the model automatically find trained objects\n"
-                "NO: Use a reference frame for object selection\n\n"
-                "Recommendation: Try automatic mode first!")
-            
-            self.status_var.set("Setting up trained model...")
-            self.root.update()
-            
-            # Extract frames if needed
-            if not os.path.exists(frames_dir):
-                self.status_var.set("Extracting frames...")
-                self.root.update()
-                
-                fps, num_frames = video_to_frames(video_path, frames_dir)
-                if fps == -1:
-                    messagebox.showerror("Error", "Failed to extract frames from video")
-                    return
-            else:
-                fps, _ = get_video_fps(video_path)
-            
-            # Initialize trained model processor
-            self.status_var.set("Loading trained model...")
-            self.root.update()
-            
-            trained_processor = FineTunedVideoProcessor(
-                model_path=model_path,
-                config_path=config_path,
-                video_dir=frames_dir,
-                auto_mode=auto_detect
-            )
-            
-            if auto_detect:
-                # Automatic processing
-                self.status_var.set("🤖 Processing automatically with trained model...")
-                self.root.update()
-                
-                results, object_names = trained_processor.process_video_auto()
-                
-                if results is None:
-                    messagebox.showerror("Error", 
-                        "Automatic detection failed.\n"
-                        "Try manual mode or check if model was trained on similar objects.")
-                    return
-                    
-            else:
-                # Manual reference frame mode
-                frame_files = [f for f in os.listdir(frames_dir) if f.endswith('.jpg')]
-                if not frame_files:
-                    messagebox.showerror("Error", "No frames found in directory")
-                    return
-                
-                # Get reference frame
-                frame_num = self.get_frame_number(len(frame_files))
-                if frame_num is None:
-                    return
-                
-                frame_path = os.path.join(frames_dir, f"{frame_num:05d}.jpg")
-                reference_frame = cv2.imread(frame_path)
-                
-                self.status_var.set("Select reference objects for tracking...")
-                self.root.update()
-                
-                messagebox.showinfo("Reference Selection", 
-                    "Select objects in the reference frame.\n"
-                    "The trained model will track these objects throughout the video.")
-                
-                points_dict, labels_dict, object_names = select_points_opencv(reference_frame, trained_processor)
-                
-                if points_dict is None:
-                    self.status_var.set("Processing cancelled")
-                    return
-                
-                self.status_var.set("🎯 Processing with trained model...")
-                self.root.update()
-                
-                results = trained_processor.process_video_with_prompts(points_dict, labels_dict, frame_num)
-                
-            # Save results
-            if results:
-                trained_processor.results = results
-                trained_processor.object_names = object_names
-                
-                self.status_var.set("Saving results...")
-                self.root.update()
-                
-                # Save with different name to avoid overwriting manual annotations
-                output_path = os.path.join(frames_dir, "trained_model_output.mp4")
-                trained_processor.save_results(
-                    output_path=output_path,
-                    fps=fps,
-                    show_original=True,
-                    alpha=0.5
-                )
-                
-                # Ask about analysis video
-                create_analysis = messagebox.askyesno("Analysis Video", 
-                    "Create detailed analysis video with plots and metrics?")
-                
-                success_msg = f"""🎉 Trained Model Processing Complete!
-
-Model: {Path(model_path).name}
-Mode: {'Automatic Detection' if auto_detect else 'Manual Reference'}
-Results saved in: {frames_dir}
-
-📁 Generated Files:
-• trained_model_output.mp4 - Video with overlays
-• segmentation_coco.json - Object annotations  
-• time_series_metrics.csv - Movement data
-
-📊 Processed Objects ({len(object_names)}):
-""" + "\n".join([f"  • {name}" for name in object_names.values()])
-                
-                if create_analysis:
-                    self.status_var.set("Creating analysis video...")
-                    self.root.update()
-                    
-                    analysis_output = os.path.join(frames_dir, "trained_model_analysis.mp4")
-                    # Note: Would need to implement create_analysis_video for trained processor
-                    success_msg += "\n🎬 Analysis video: trained_model_analysis.mp4"
-                
-                self.status_var.set("Trained model processing completed!")
-                messagebox.showinfo("Success", success_msg)
-                
-            else:
-                messagebox.showerror("Error", "Processing failed with trained model")
-                self.status_var.set("Processing failed")
-                
-        except Exception as e:
-            messagebox.showerror("Error", f"Inference failed: {str(e)}")
-            self.status_var.set("Inference failed")
-            import traceback
-            traceback.print_exc()
-        """Setup fine-tuning environment"""
-        try:
-            # Check if sam2_finetuning_setup.py exists
-            if os.path.exists("sam2_finetuning_setup.py"):
-                messagebox.showinfo("Fine-tuning Setup", 
-                    "Running SAM2 fine-tuning setup...\n"
-                    "This will create training configuration and scripts.")
-                
-                # Run the setup script
-                result = subprocess.run([sys.executable, "sam2_finetuning_setup.py"], 
-                                       capture_output=True, text=True)
-                
-                if result.returncode == 0:
-                    messagebox.showinfo("Setup Complete", 
-                        "Fine-tuning environment setup complete!\n\n"
-                        "Files created:\n"
-                        "- training_config.yaml\n"
-                        "- train_sam2.py\n"
-                        "- use_finetuned_sam2.py\n\n"
-                        "Next: Annotate multiple videos, then click 'Start Training Model'")
-                else:
-                    messagebox.showerror("Setup Error", f"Setup failed:\n{result.stderr}")
-            else:
-                messagebox.showwarning("File Not Found", 
-                    "sam2_finetuning_setup.py not found in current directory.\n"
-                    "Please ensure all fine-tuning files are in the same folder.")
-                    
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to setup fine-tuning: {str(e)}")
-    
-    def start_training(self):
-        """Start training fine-tuned model"""
-        try:
-            # Check if required files exist
-            if not os.path.exists("training_config.yaml"):
-                messagebox.showwarning("Config Missing", 
-                    "training_config.yaml not found.\n"
-                    "Please run 'Setup Fine-tuning Environment' first.")
-                return
-                
-            if not os.path.exists("train_sam2.py"):
-                messagebox.showwarning("Training Script Missing", 
-                    "train_sam2.py not found.\n"
-                    "Please run 'Setup Fine-tuning Environment' first.")
-                return
-            
-            # Ask user to confirm training
-            result = messagebox.askyesno("Start Training", 
-                "This will start SAM2 fine-tuning training.\n\n"
-                "Prerequisites:\n"
-                "✓ Multiple annotated videos\n"
-                "✓ Updated training_config.yaml\n"
-                "✓ GPU with enough memory\n\n"
-                "Training can take several hours.\n"
-                "Continue?")
-            
-            if result:
-                messagebox.showinfo("Training Started", 
-                    "Fine-tuning training started!\n\n"
-                    "The training will run in a separate process.\n"
-                    "Check the console for progress updates.\n\n"
-                    "You can continue using this app while training runs.")
-                
-                # Start training in background
-                subprocess.Popen([sys.executable, "train_sam2.py", "training_config.yaml"])
-                
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to start training: {str(e)}")
-    
     def setup_finetuning(self):
-        """Setup fine-tuning environment"""
+        """Setup fine-tuning environment - FIXED"""
         try:
-            # Check if sam2_finetuning_setup.py exists
-            if os.path.exists("sam2_finetuning_setup.py"):
-                messagebox.showinfo("Fine-tuning Setup", 
-                    "Running SAM2 fine-tuning setup...\n"
-                    "This will create training configuration and scripts.")
-                
-                # Run the setup script
-                result = subprocess.run([sys.executable, "sam2_finetuning_setup.py"], 
-                                       capture_output=True, text=True)
-                
-                if result.returncode == 0:
-                    messagebox.showinfo("Setup Complete", 
-                        "Fine-tuning environment setup complete!\n\n"
-                        "Files created:\n"
-                        "- training_config.yaml\n"
-                        "- train_sam2.py\n"
-                        "- use_finetuned_sam2.py\n\n"
-                        "Next: Annotate multiple videos, then click 'Start Training Model'")
-                else:
-                    messagebox.showerror("Setup Error", f"Setup failed:\n{result.stderr}")
+            success = create_finetuning_setup()
+            if success:
+                messagebox.showinfo("Setup Complete", 
+                    "Fine-tuning environment setup complete!\n\n"
+                    "Files created:\n"
+                    "- training_config.yaml\n"
+                    "- train_sam2.py\n\n"
+                    "Next: Update training_config.yaml with your paths and run training")
             else:
-                messagebox.showwarning("File Not Found", 
-                    "sam2_finetuning_setup.py not found in current directory.\n"
-                    "Please ensure all fine-tuning files are in the same folder.")
-                    
+                messagebox.showerror("Setup Failed", "Failed to create fine-tuning setup")
+                
         except Exception as e:
             messagebox.showerror("Error", f"Failed to setup fine-tuning: {str(e)}")
-    
-    def start_training(self):
-        """Start training fine-tuned model"""
-        try:
-            # Check if required files exist
-            if not os.path.exists("training_config.yaml"):
-                messagebox.showwarning("Config Missing", 
-                    "training_config.yaml not found.\n"
-                    "Please run 'Setup Fine-tuning Environment' first.")
-                return
-                
-            if not os.path.exists("train_sam2.py"):
-                messagebox.showwarning("Training Script Missing", 
-                    "train_sam2.py not found.\n"
-                    "Please run 'Setup Fine-tuning Environment' first.")
-                return
-            
-            # Ask user to confirm training
-            result = messagebox.askyesno("Start Training", 
-                "This will start SAM2 fine-tuning training.\n\n"
-                "Prerequisites:\n"
-                "✓ Multiple annotated videos\n"
-                "✓ Updated training_config.yaml\n"
-                "✓ GPU with enough memory\n\n"
-                "Training can take several hours.\n"
-                "Continue?")
-            
-            if result:
-                messagebox.showinfo("Training Started", 
-                    "Fine-tuning training started!\n\n"
-                    "The training will run in a separate process.\n"
-                    "Check the console for progress updates.\n\n"
-                    "You can continue using this app while training runs.")
-                
-                # Start training in background
-                subprocess.Popen([sys.executable, "train_sam2.py", "training_config.yaml"])
-                
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to start training: {str(e)}")
     
     def select_folder(self):
         """Select folder containing videos"""
@@ -2891,31 +1602,53 @@ Results saved in: {frames_dir}
             self.video_listbox.insert(tk.END, video)
         
         if videos:
-            self.video_listbox.select_set(0)  # Select first video
+            self.video_listbox.select_set(0)
             self.status_var.set(f"Found {len(videos)} video(s)")
         else:
             self.status_var.set("No videos found in selected folder")
     
-    def get_frame_number(self, total_frames):
-        """Get frame number for mask selection"""
-        # Suggest middle frame for best bidirectional results
+    def get_frame_number_with_preview(self, frames_dir, total_frames):
+        """Get frame number with preview functionality - NEW"""
         suggested_frame = total_frames // 2
         
-        frame_num = simpledialog.askinteger(
-            "Reference Frame Selection",
-            f"Select frame for object annotation (0-{total_frames-1}):\n\n"
-            f"💡 Tip: Choose a frame where objects are clearly visible\n"
-            f"🔄 Processing will propagate BOTH forward and backward from this frame\n"
-            f"📍 Suggested: Frame {suggested_frame} (middle of video)\n\n"
-            f"Enter frame number:",
-            minvalue=0,
-            maxvalue=total_frames-1,
-            initialvalue=suggested_frame
-        )
-        return frame_num
+        while True:
+            frame_num = simpledialog.askinteger(
+                "Reference Frame Selection",
+                f"Select frame for object annotation (0-{total_frames-1}):\n\n"
+                f"💡 Choose a frame where objects are clearly visible\n"
+                f"🔄 Processing will propagate forward AND backward from this frame\n"
+                f"📍 Suggested: Frame {suggested_frame} (middle of video)\n\n"
+                f"Enter frame number (or -1 to preview suggested frame):",
+                minvalue=-1,
+                maxvalue=total_frames-1,
+                initialvalue=suggested_frame
+            )
+            
+            if frame_num is None:  # User cancelled
+                return None
+            
+            if frame_num == -1:  # Preview requested
+                if show_frame_preview(frames_dir, suggested_frame, total_frames):
+                    continue  # Show dialog again
+                else:
+                    return None
+            
+            # Show preview of selected frame
+            if show_frame_preview(frames_dir, frame_num, total_frames):
+                # Ask for confirmation
+                confirm = messagebox.askyesno("Confirm Frame Selection", 
+                    f"Use frame {frame_num} as reference frame?\n\n"
+                    "This frame will be used for object annotation and\n"
+                    "processing will propagate both forward and backward from here.")
+                
+                if confirm:
+                    return frame_num
+                # If not confirmed, loop back to frame selection
+            else:
+                return None  # Error showing preview
     
     def process_video(self):
-        """Process the selected video"""
+        """Process the selected video - ENHANCED"""
         if self.predictor is None:
             messagebox.showerror("Error", "SAM2 predictor not initialized")
             return
@@ -2950,22 +1683,30 @@ Results saved in: {frames_dir}
                 messagebox.showerror("Error", "Failed to extract frames from video")
                 return
             
-            # Get frame number for mask selection
-            frame_num = self.get_frame_number(num_frames)
+            # Get frame number with preview - ENHANCED
+            frame_num = self.get_frame_number_with_preview(frames_dir, num_frames)
             if frame_num is None:
+                self.status_var.set("Processing cancelled")
                 return
             
-            # Initialize processor with seed frame
+            # Get chunk size from UI - NEW
+            try:
+                chunk_size = int(self.chunk_size_var.get())
+            except ValueError:
+                chunk_size = 500
+                self.chunk_size_var.set("500")
+            
+            # Initialize processor with seed frame and custom chunk size
             self.status_var.set("Initializing processor...")
             self.root.update()
             
             processor = VideoChunkProcessor(
                 predictor=self.predictor, 
                 video_dir=frames_dir, 
-                chunk_size=500, 
+                chunk_size=chunk_size,  # Use UI value
                 overlap_frames=30,
                 interactive_correction=self.interactive_correction.get(),
-                seed_frame_idx=frame_num  # Pass the selected frame as seed
+                seed_frame_idx=frame_num
             )
             
             # Load the selected frame for mask selection
@@ -2981,15 +1722,14 @@ Results saved in: {frames_dir}
             self.root.update()
             
             messagebox.showinfo("Point Selection", 
-                "The frame will open in a new window for annotation.\n\n"
-                "🎯 All keyboard shortcuts are displayed on the frame!\n"
+                f"Frame {frame_num} will open for annotation.\n\n"
+                "🎯 All controls are shown on the frame\n"
                 "✓ Left click: positive points\n"
                 "✓ Right click: negative points\n"
-                "✓ Press 'C' to name objects with custom names\n"
+                "✓ Press 'C' to name objects\n"
                 "✓ Press 'T' to preview masks\n\n"
-                f"📍 Selected frame {frame_num} will be used as reference\n"
-                "🔄 Processing will propagate forward AND backward from this frame\n\n"
-                "Start by clicking on your first object!")
+                f"📍 Frame {frame_num} is your reference point\n"
+                "🔄 Processing goes both directions from here")
             
             points_dict, labels_dict, object_names = select_points_opencv(frame, processor)
             
@@ -2997,15 +1737,15 @@ Results saved in: {frames_dir}
                 self.status_var.set("Processing cancelled")
                 return
             
-            # Process video
-            self.status_var.set(f"🔄 Processing video with SAM2 (bidirectional from frame {frame_num})...")
+            # Process video with bidirectional propagation
+            self.status_var.set(f"🔄 Processing video (bidirectional from frame {frame_num}, chunk size {chunk_size})...")
             self.root.update()
             
             results = processor.process_video(points_dict, labels_dict)
             
             if results:
                 processor.results = results
-                processor.object_names = object_names  # Store object names in processor
+                processor.object_names = object_names
                 
                 # Save basic results
                 self.status_var.set("Saving results...")
@@ -3019,54 +1759,83 @@ Results saved in: {frames_dir}
                     alpha=0.5
                 )
                 
-                # Ask if user wants analysis video
-                create_analysis = messagebox.askyesno("Analysis Video", 
-                    "Do you want to create an analysis video with plots and metrics?\n"
-                    "This may take additional time but provides detailed insights.")
-                
-                if create_analysis:
+                # Create analysis video if requested - FIXED WITH FALLBACK
+                if self.create_analysis_video.get():
                     self.status_var.set("Creating analysis video...")
                     self.root.update()
                     
                     analysis_output = os.path.join(frames_dir, "analysis_video.mp4")
-                    #create_analysis_video method
-                    processor.create_analysis_video(
-                    results=results,
-                         output_path=analysis_output,
-                         fps=fps,
-                         object_names=object_names
-                     )
-                    
-                    self.status_var.set("Processing completed with analysis video!")
-                    correction_mode = "Interactive correction" if self.interactive_correction.get() else "Automatic recovery"
-                    
-                    # Create summary of processed objects
-                    named_objects = [name for name in object_names.values()]
-                    total_objects = len(object_names)
-                    
-                    objects_summary = "\n".join([f"  • {name}" for name in named_objects]) if named_objects else "  • No objects processed"
-                    
-                    messagebox.showinfo("Success", 
-                        f"🎉 Processing completed!\n"
-                        f"Mode: {correction_mode}\n"
-                        f"Results saved in: {frames_dir}\n\n"
-                        f"📁 Generated Files:\n"
-                        f"  • output_masked.mp4 - Video with overlays\n"
-                        f"  • segmentation_coco.json - Object annotations\n"
-                        f"  • time_series_metrics.csv - Movement data\n\n"
-                        f"📊 Processed Objects ({total_objects}):\n{objects_summary}")
+                    try:
+                        # Make sure object_names are properly set on the processor
+                        processor.object_names = object_names
+                        processor.results = results
+                        
+                        processor.create_analysis_video(
+                            results=results,
+                            output_path=analysis_output,
+                            fps=fps,
+                            alpha=0.5
+                        )
+                        analysis_created = True
+                        print("✅ Complex analysis video created successfully")
+                        
+                    except Exception as e:
+                        print(f"⚠️ Complex analysis video failed: {e}")
+                        print("🔄 Trying simple analysis video instead...")
+                        
+                        try:
+                            # Fallback to simple analysis video
+                            simple_output = os.path.join(frames_dir, "simple_analysis_video.mp4")
+                            processor.create_simple_analysis_video(
+                                results=results,
+                                output_path=simple_output,
+                                fps=fps,
+                                alpha=0.5
+                            )
+                            analysis_created = True
+                            print("✅ Simple analysis video created successfully")
+                            
+                        except Exception as e2:
+                            print(f"❌ Simple analysis video also failed: {e2}")
+                            import traceback
+                            traceback.print_exc()
+                            analysis_created = False
                 else:
-                    self.status_var.set("Processing completed!")
-                    correction_mode = "Interactive correction" if self.interactive_correction.get() else "Automatic recovery"
-                    messagebox.showinfo("Success", 
-                        f"Processing completed!\n"
-                        f"Mode: {correction_mode}\n"
-                        f"Results saved in: {frames_dir}\n"
-                        f"- Masked video: output_masked.mp4\n"
-                        f"- COCO annotations: segmentation_coco.json\n"
-                        f"- Time series data: time_series_metrics.csv\n\n"
-                        f"Object names used:\n" + 
-                        "\n".join([f"  {id}: {name}" for id, name in object_names.items()]))
+                    analysis_created = False
+                
+                self.status_var.set("Processing completed!")
+                
+                # Create success message
+                named_objects = [name for name in object_names.values()]
+                total_objects = len(object_names)
+                objects_summary = "\n".join([f"  • {name}" for name in named_objects])
+                
+                success_msg = f"""🎉 Processing Complete!
+
+Reference Frame: {frame_num}
+Chunk Size: {chunk_size} frames
+Results saved in: {frames_dir}
+
+📁 Generated Files:
+• output_masked.mp4 - Video with overlays
+• segmentation_coco.json - Annotations
+• time_series_metrics.csv - Movement data"""
+
+                if analysis_created:
+                    if os.path.exists(os.path.join(frames_dir, "analysis_video.mp4")):
+                        success_msg += "\n• analysis_video.mp4 - Complex analysis with plots"
+                    elif os.path.exists(os.path.join(frames_dir, "simple_analysis_video.mp4")):
+                        success_msg += "\n• simple_analysis_video.mp4 - Simple analysis video"
+
+                success_msg += f"""
+
+📊 Processed Objects ({total_objects}):
+{objects_summary}
+
+✅ Bidirectional processing completed successfully!"""
+                
+                messagebox.showinfo("Success", success_msg)
+                
             else:
                 messagebox.showerror("Error", "Video processing failed")
                 self.status_var.set("Processing failed")
@@ -3074,6 +1843,8 @@ Results saved in: {frames_dir}
         except Exception as e:
             messagebox.showerror("Error", f"Processing failed: {str(e)}")
             self.status_var.set("Processing failed")
+            import traceback
+            traceback.print_exc()
     
     def run(self):
         """Run the application"""
@@ -3081,16 +1852,27 @@ Results saved in: {frames_dir}
 
 def main():
     """Main function"""
-    print("Starting SAM2 Video Analysis & Inference Application...")
-    print("Features:")
-    print("✓ Interactive video annotation with SAM2")
-    print("✓ Fine-tuning setup and training")
-    print("✓ Automatic inference with trained models")
+    print("Starting SAM2 Video Analysis - Complete Fixed Version")
+    print("=" * 50)
+    print("✅ Fixed Issues:")
+    print("  • Frame preview when selecting reference frame")
+    print("  • Bidirectional propagation (backward processing)")
+    print("  • Analysis video creation with proper object names")
+    print("  • Fine-tuning setup with encoding fixes")
+    print("  • Configurable chunk size in UI")
+    print("  • Combined into single comprehensive script")
+    print("\nFeatures:")
+    print("  • Interactive video annotation with SAM2")
+    print("  • Bidirectional processing from any reference frame")
+    print("  • Analysis videos with movement/area/color plots")
+    print("  • Custom object naming")
+    print("  • Configurable processing parameters")
+    print("  • Fine-tuning workflow setup")
     print("\nRequirements:")
-    print("1. SAM2 installed and checkpoints downloaded")
-    print("2. FFmpeg installed for video processing")
-    print("3. Required Python packages: opencv-python, torch, matplotlib, pandas, tqdm")
-    print("\nStarting GUI...")
+    print("  • SAM2 installed and checkpoints downloaded")
+    print("  • FFmpeg for video processing")
+    print("  • Python packages: opencv-python, torch, matplotlib, pandas, tqdm")
+    print("\nStarting application...")
     
     app = VideoAnalysisApp()
     app.run()

@@ -1,0 +1,24 @@
+# SAM2 Fine-tuning Configuration
+model:
+  type: "sam2_hiera_l"
+  checkpoint: "checkpoints/sam2.1_hiera_large.pt" 
+  freeze_image_encoder: false
+  
+dataset:
+  name: "custom_objects"
+  annotation_dirs: ["./video1_frames", "./video2_frames"]  # Update with your paths
+  object_names: ["Object_1", "Object_2"]  # Update with your object names
+  train_split: 0.8
+  val_split: 0.2
+  image_size: [1024, 1024]
+  
+training:
+  batch_size: 4
+  learning_rate: 1e-5
+  num_epochs: 50
+  weight_decay: 1e-4
+  
+output:
+  save_dir: "./sam2_finetuned"
+  save_every: 10
+  eval_every: 5
