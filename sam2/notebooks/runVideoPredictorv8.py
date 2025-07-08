@@ -27,7 +27,7 @@ from tqdm import tqdm
 import pandas as pd
 import psutil
 
-# Ultra-aggressive memory optimization (same as before)
+# memory optimization (same as before)
 os.environ["SAM2_OFFLOAD_VIDEO_TO_CPU"] = "true"
 os.environ["SAM2_OFFLOAD_STATE_TO_CPU"] = "true"
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
@@ -49,7 +49,7 @@ def get_gpu_memory_info():
     return None
 
 def ultra_cleanup_memory():
-    """Ultra-aggressive memory cleanup"""
+    """memory cleanup"""
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -58,7 +58,7 @@ def ultra_cleanup_memory():
     gc.collect()
 
 def configure_torch_ultra_conservative():
-    """Configure PyTorch for ultra-conservative memory usage"""
+    """Configure PyTorch for memory usage"""
     if torch.cuda.is_available():
         torch.cuda.set_per_process_memory_fraction(0.70)
         
@@ -74,10 +74,10 @@ def configure_torch_ultra_conservative():
             torch.backends.cudnn.allow_tf32 = True
         
         ultra_cleanup_memory()
-        print(f"GPU Memory after ultra-conservative setup: {get_gpu_memory_info()}")
+        print(f"GPU Memory after setup: {get_gpu_memory_info()}")
 
 def setup_device_ultra_optimized():
-    """Setup computation device with ultra-conservative settings"""
+    """Setup computation device with settings"""
     if torch.cuda.is_available():
         device = torch.device("cuda")
         gpu_info = get_gpu_memory_info()
@@ -172,16 +172,30 @@ class EnhancedOverlapDetector:
     
     def __init__(self, overlap_threshold=0.1):
         self.overlap_threshold = overlap_threshold
-        self.inclusion_threshold = 0.8  # 80% overlap = inclusion
+        self.inclusion_threshold = 0.1  # 80% overlap = inclusion
         
     def calculate_detailed_overlap(self, mask1, mask2):
-        """Calculate detailed overlap information including inclusion detection"""
+        """Enhanced overlap detection with both pixel overlap and spatial containment"""
         if mask1.shape != mask2.shape:
+            print(f"❌ Shape mismatch: {mask1.shape} vs {mask2.shape}")
             return None
         
-        # Ensure masks are boolean
-        mask1_bool = mask1.astype(bool)
-        mask2_bool = mask2.astype(bool)
+        # Ensure masks are 2D
+        if len(mask1.shape) > 2:
+            mask1 = mask1.squeeze()
+        if len(mask2.shape) > 2:
+            mask2 = mask2.squeeze()
+        
+        # VERY AGGRESSIVE boolean conversion - catch any non-zero values
+        if mask1.dtype in [np.float32, np.float64]:
+            mask1_bool = mask1 > 0.0001
+        else:
+            mask1_bool = mask1 > 0
+        
+        if mask2.dtype in [np.float32, np.float64]:
+            mask2_bool = mask2 > 0.0001
+        else:
+            mask2_bool = mask2 > 0
         
         # Calculate areas
         area1 = np.sum(mask1_bool)
@@ -190,37 +204,127 @@ class EnhancedOverlapDetector:
         if area1 == 0 or area2 == 0:
             return None
         
-        # Calculate intersection
-        intersection = np.logical_and(mask1_bool, mask2_bool)
+        # Calculate pixel intersection
+        intersection = mask1_bool & mask2_bool
         intersection_area = np.sum(intersection)
         
-        if intersection_area == 0:
+        # Calculate overlap percentages for pixel overlap
+        overlap_pct_1 = intersection_area / area1 if area1 > 0 else 0
+        overlap_pct_2 = intersection_area / area2 if area2 > 0 else 0
+        max_overlap = max(overlap_pct_1, overlap_pct_2)
+        
+        # SPATIAL CONTAINMENT DETECTION
+        spatial_relationship = False
+        containment_type = None
+        
+        try:
+            # Find contours for both masks
+            contours1, _ = cv2.findContours(mask1_bool.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            contours2, _ = cv2.findContours(mask2_bool.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            if contours1 and contours2:
+                # Get the largest contour for each mask
+                contour1 = max(contours1, key=cv2.contourArea)
+                contour2 = max(contours2, key=cv2.contourArea)
+                
+                # Calculate centroids
+                M1 = cv2.moments(contour1)
+                M2 = cv2.moments(contour2)
+                
+                if M1['m00'] != 0 and M2['m00'] != 0:
+                    cx1, cy1 = int(M1['m10']/M1['m00']), int(M1['m01']/M1['m00'])
+                    cx2, cy2 = int(M2['m10']/M2['m00']), int(M2['m01']/M2['m00'])
+                    
+                    # Check for partial area containment FIRST (any part of object inside boundary)
+                    # Create masks for contour areas
+                    mask1_contour = np.zeros_like(mask1_bool, dtype=np.uint8)
+                    mask2_contour = np.zeros_like(mask2_bool, dtype=np.uint8)
+                    cv2.fillPoly(mask1_contour, [contour1], 1)
+                    cv2.fillPoly(mask2_contour, [contour2], 1)
+                    
+                    # Check if any part of object2 is within contour1 boundary
+                    object2_in_contour1 = np.any(mask2_bool & mask1_contour)
+                    # Check if any part of object1 is within contour2 boundary  
+                    object1_in_contour2 = np.any(mask1_bool & mask2_contour)
+                    
+                    if object2_in_contour1:
+                        spatial_relationship = True
+                        overlap_area = np.sum(mask2_bool & mask1_contour)
+                        containment_type = "object2_partial_inside_object1"
+                        print(f"    🎯 Part of Object 2 is INSIDE Object 1 boundary ({overlap_area} pixels)")
+                    elif object1_in_contour2:
+                        spatial_relationship = True
+                        overlap_area = np.sum(mask1_bool & mask2_contour)
+                        containment_type = "object1_partial_inside_object2"
+                        print(f"    🎯 Part of Object 1 is INSIDE Object 2 boundary ({overlap_area} pixels)")
+                    else:
+                        # Fallback to centroid check only if no partial containment
+                        inside_1 = cv2.pointPolygonTest(contour1, (cx2, cy2), False) >= 0
+                        inside_2 = cv2.pointPolygonTest(contour2, (cx1, cy1), False) >= 0
+                        
+                        if inside_1:
+                            spatial_relationship = True
+                            containment_type = "object2_centroid_inside_object1"
+                            print(f"    🎯 Object 2 centroid is INSIDE Object 1 boundary")
+                        elif inside_2:
+                            spatial_relationship = True
+                            containment_type = "object1_centroid_inside_object2"
+                            print(f"    🎯 Object 1 centroid is INSIDE Object 2 boundary")
+                    
+
+        
+        except Exception as e:
+            print(f"    ⚠️ Error in spatial containment detection: {e}")
+            spatial_relationship = False
+        
+        # Determine relationship type and strength
+        # Apply percentage threshold to pixel overlap
+        has_meaningful_pixel_overlap = intersection_area > 0 and max_overlap >= self.overlap_threshold
+        has_spatial_relationship = spatial_relationship
+        
+        # If no relationship at all, return None
+        if not has_meaningful_pixel_overlap and not has_spatial_relationship:
             return None
         
-        # Calculate overlap percentages
-        overlap_pct_1 = intersection_area / area1  # How much of mask1 is covered by mask2
-        overlap_pct_2 = intersection_area / area2  # How much of mask2 is covered by mask1
+        # Enhanced criteria: Accept EITHER meaningful pixel overlap OR spatial containment
+        meets_basic_threshold = has_meaningful_pixel_overlap or has_spatial_relationship
+        meets_continuation_threshold = has_meaningful_pixel_overlap or has_spatial_relationship
         
         # Determine relationship type
-        relationship_type = "overlap"  # Default
+        if has_meaningful_pixel_overlap and has_spatial_relationship:
+            relationship_type = "overlap_and_containment"
+        elif has_meaningful_pixel_overlap:
+            relationship_type = "pixel_overlap"
+        elif has_spatial_relationship:
+            relationship_type = "spatial_containment"
+        else:
+            relationship_type = "none"
         
-        if overlap_pct_1 >= self.inclusion_threshold:
-            relationship_type = "mask1_included_in_mask2"  # mask1 is mostly inside mask2
-        elif overlap_pct_2 >= self.inclusion_threshold:
-            relationship_type = "mask2_included_in_mask1"  # mask2 is mostly inside mask1
-        
-        # Use the smaller overlap percentage for threshold comparison
-        min_overlap_pct = min(overlap_pct_1, overlap_pct_2)
+        print(f"  🔍 Enhanced overlap analysis:")
+        if intersection_area > 0:
+            print(f"    Pixel intersection: {intersection_area} pixels")
+            print(f"    Max pixel overlap: {max_overlap:.1%}")
+            print(f"    Meets pixel threshold ({self.overlap_threshold:.1%}): {has_meaningful_pixel_overlap}")
+        if has_spatial_relationship:
+            print(f"    Spatial relationship: {containment_type}")
+        print(f"    Final relationship type: {relationship_type}")
+        print(f"    Meets threshold: {meets_basic_threshold}")
         
         return {
             'intersection_area': intersection_area,
-            'overlap_pct_1': overlap_pct_1,  # How much of object 1 overlaps
-            'overlap_pct_2': overlap_pct_2,  # How much of object 2 overlaps
-            'min_overlap_pct': min_overlap_pct,
-            'max_overlap_pct': max(overlap_pct_1, overlap_pct_2),
+            'overlap_pct_1': overlap_pct_1,
+            'overlap_pct_2': overlap_pct_2,
+            'min_overlap_pct': min(overlap_pct_1, overlap_pct_2),
+            'max_overlap_pct': max_overlap,
+            'spatial_relationship': spatial_relationship,
+            'containment_type': containment_type,
+            'has_meaningful_pixel_overlap': has_meaningful_pixel_overlap,
+            'has_spatial_relationship': has_spatial_relationship,
             'relationship_type': relationship_type,
-            'meets_threshold': min_overlap_pct >= self.overlap_threshold
+            'meets_threshold': meets_basic_threshold,
+            'meets_continuation_threshold': meets_continuation_threshold
         }
+
 
 class ImprovedTargetOverlapTracker:
     """Improved overlap tracker with better inclusion detection and annotations"""
@@ -240,157 +344,6 @@ class ImprovedTargetOverlapTracker:
             return True
         return False
     
-    def analyze_frame_overlaps(self, frame_results, object_names):
-        """Simplified frame overlap analysis - just detect 'looking at' events"""
-        frame_analysis = {
-            'target_overlaps': {},  # target_id -> list of objects being looked at
-            'object_relationships': {},  # obj_id -> relationship info
-            'looking_at_events': []  # Simple list of looking-at relationships
-        }
-        
-        try:
-            # Analyze target relationships - treat inclusion and overlap the same
-            for target_id in self.target_objects:
-                if target_id not in frame_results:
-                    continue
-                    
-                target_mask = frame_results[target_id]
-                if len(target_mask.shape) > 2:
-                    target_mask = target_mask.squeeze()
-                
-                target_name = self.target_objects[target_id]
-                looking_at_objects = []
-                
-                # Check what the target is looking at (any spatial relationship)
-                for obj_id, mask in frame_results.items():
-                    if obj_id == target_id:
-                        continue
-                        
-                    if len(mask.shape) > 2:
-                        mask = mask.squeeze()
-                    
-                    try:
-                        # Use enhanced detector but simplify the output
-                        overlap_info = self.detector.calculate_detailed_overlap(target_mask, mask)
-                        
-                        if overlap_info and overlap_info['meets_threshold']:
-                            obj_name = object_names.get(obj_id, f"Object_{obj_id}")
-                            
-                            # Treat all types of overlap as "looking at"
-                            looking_at_objects.append({
-                                'object_id': obj_id,
-                                'object_name': obj_name,
-                                'event_type': 'looking_at'
-                            })
-                            
-                            # Store for ELAN export
-                            frame_analysis['looking_at_events'].append({
-                                'target_id': target_id,
-                                'target_name': target_name,
-                                'object_id': obj_id,
-                                'object_name': obj_name
-                            })
-                    except Exception as overlap_error:
-                        # Skip this object pair if overlap calculation fails
-                        continue
-                
-                if looking_at_objects:
-                    frame_analysis['target_overlaps'][target_id] = looking_at_objects
-            
-            # Create simplified object relationship mapping
-            for target_id, looking_at_objects_list in frame_analysis['target_overlaps'].items():
-                target_name = self.target_objects[target_id]
-                
-                # Store info for the target object
-                object_names_list = [obj['object_name'] for obj in looking_at_objects_list]
-                if len(object_names_list) == 1:
-                    display_text = f"TARGET {target_name} LOOKING AT {object_names_list[0]}"
-                else:
-                    display_text = f"TARGET {target_name} LOOKING AT {', '.join(object_names_list)}"
-                
-                frame_analysis['object_relationships'][target_id] = {
-                    'is_target': True,
-                    'looking_at_objects': looking_at_objects_list,  # Fixed variable name
-                    'display_text': display_text,
-                    'event_type': 'looking_at'
-                }
-                
-                # Store info for each object being looked at
-                for obj_info in looking_at_objects_list:
-                    obj_id = obj_info['object_id']
-                    obj_name = obj_info['object_name']
-                    
-                    frame_analysis['object_relationships'][obj_id] = {
-                        'is_target': False,
-                        'looked_at_by': target_id,
-                        'target_name': target_name,
-                        'display_text': f"{obj_name} LOOKED AT BY TARGET {target_name}",
-                        'event_type': 'looked_at'
-                    }
-            
-        except Exception as e:
-            print(f"  ⚠️ Error in analyze_frame_overlaps: {e}")
-        
-        return frame_analysis
-    
-
-    
-    def track_frame_overlaps_batch(self, frame_idx, frame_results, object_names):
-        """Track 'looking at' events for a frame with proper timing and error handling"""
-        try:
-            frame_analysis = self.analyze_frame_overlaps(frame_results, object_names)
-            
-            # Update overlap events for each target with simplified event names
-            for target_id in self.target_objects:
-                if target_id in frame_analysis.get('target_overlaps', {}):
-                    looking_at_objects = frame_analysis['target_overlaps'][target_id]
-                    object_names_list = [obj['object_name'] for obj in looking_at_objects]
-                    self._update_overlap_event(target_id, frame_idx, object_names_list)
-            
-            return frame_analysis
-            
-        except Exception as e:
-            print(f"  ⚠️ Error in track_frame_overlaps_batch for frame {frame_idx}: {e}")
-            # Return empty frame analysis to continue processing
-            return {
-                'target_overlaps': {},
-                'object_relationships': {},
-                'looking_at_events': []
-            }
-    
-    def _update_overlap_event(self, target_id, frame_idx, overlapping_names):
-        """Update overlap events efficiently - simplified for 'looking at' events"""
-        events = self.overlap_events[target_id]
-        current_overlap_set = set(overlapping_names)
-        
-        if events and not events[-1].get('end_frame'):
-            last_event = events[-1]
-            last_overlap_set = set(last_event['overlapping_objects'])
-            
-            if current_overlap_set == last_overlap_set:
-                last_event['end_frame'] = frame_idx
-                last_event['duration_frames'] = frame_idx - last_event['start_frame'] + 1
-                return
-            else:
-                last_event['end_frame'] = frame_idx - 1
-                last_event['duration_frames'] = last_event['end_frame'] - last_event['start_frame'] + 1
-        
-        new_event = {
-            'start_frame': frame_idx,
-            'end_frame': None,
-            'duration_frames': 1,
-            'overlapping_objects': list(overlapping_names),
-            'event_type': 'looking_at'  # Add event type for ELAN
-        }
-        events.append(new_event)
-    
-    def finalize_tracking(self, last_frame_idx):
-        """Finalize any open events"""
-        for target_id, events in self.overlap_events.items():
-            if events and not events[-1].get('end_frame'):
-                events[-1]['end_frame'] = last_frame_idx
-                events[-1]['duration_frames'] = last_frame_idx - events[-1]['start_frame'] + 1
-    
     def get_overlap_summary(self):
         """Get overlap summary"""
         summary = {}
@@ -403,6 +356,201 @@ class ImprovedTargetOverlapTracker:
             }
         return summary
     
+    def finalize_tracking(self, last_frame_idx):
+        """PRECISE finalize - don't extend events, keep them as detected"""
+        for target_id, events in self.overlap_events.items():
+            target_name = self.target_objects[target_id]
+            
+            if events and events[-1].get('end_frame') is None:
+                last_event = events[-1]
+                
+                # If event has no end_frame, it means it was ongoing
+                # End it at the last frame where we had duration_frames
+                if 'duration_frames' in last_event and last_event['duration_frames'] > 0:
+                    last_event['end_frame'] = last_event['start_frame'] + last_event['duration_frames'] - 1
+                else:
+                    # Single frame event
+                    last_event['end_frame'] = last_event['start_frame']
+                    last_event['duration_frames'] = 1
+                
+                print(f"  📝 Precise finalize for {target_name}: frames {last_event['start_frame']}-{last_event['end_frame']} ({last_event['duration_frames']} frames)")
+
+    def analyze_frame_overlaps(self, frame_results, object_names):
+        """Enhanced frame analysis with continuation validation"""
+        frame_analysis = {
+            'target_overlaps': {},
+            'object_relationships': {},
+            'looking_at_events': []
+        }
+        
+        try:
+            for target_id in self.target_objects:
+                if target_id not in frame_results:
+                    continue
+                    
+                target_mask = frame_results[target_id]
+                if len(target_mask.shape) > 2:
+                    target_mask = target_mask.squeeze()
+                
+                target_name = self.target_objects[target_id]
+                looking_at_objects = []
+                
+                # Check if we have an ongoing event for this target
+                has_ongoing_event = (self.overlap_events[target_id] and 
+                                not self.overlap_events[target_id][-1].get('end_frame'))
+                
+                for obj_id, mask in frame_results.items():
+                    if obj_id == target_id:
+                        continue
+                        
+                    if len(mask.shape) > 2:
+                        mask = mask.squeeze()
+                    
+                    obj_name = object_names.get(obj_id, f"Object_{obj_id}")
+                    
+                    try:
+                        overlap_info = self.detector.calculate_detailed_overlap(target_mask, mask)
+                        
+                        if overlap_info:
+                            # Use different criteria for new vs continuing events
+                            if has_ongoing_event:
+                                # For continuing events, require stronger overlap
+                                if overlap_info.get('meets_continuation_threshold', False):
+                                    looking_at_objects.append({
+                                        'object_id': obj_id,
+                                        'object_name': obj_name,
+                                        'event_type': 'looking_at',
+                                        'relationship_desc': f"LOOKING AT {obj_name} (continuing)"
+                                    })
+                                    print(f"      ✅ STRONG OVERLAP CONTINUES: {target_name} ↔ {obj_name}")
+                                else:
+                                    print(f"      ⚠️ WEAK OVERLAP (ending event): {target_name} ↔ {obj_name}")
+                            else:
+                                # For new events, use basic threshold (ultra-sensitive)
+                                if overlap_info.get('meets_threshold', False):
+                                    looking_at_objects.append({
+                                        'object_id': obj_id,
+                                        'object_name': obj_name,
+                                        'event_type': 'looking_at',
+                                        'relationship_desc': f"LOOKING AT {obj_name}"
+                                    })
+                                    if has_ongoing_event:
+                                        print(f"      ✅ OVERLAP CONTINUES: {target_name} ↔ {obj_name}")
+                                    else:
+                                        print(f"      ✅ NEW OVERLAP DETECTED: {target_name} ↔ {obj_name}")
+                            
+                            # Store for ELAN export
+                            if looking_at_objects and looking_at_objects[-1]['object_id'] == obj_id:
+                                frame_analysis['looking_at_events'].append({
+                                    'target_id': target_id,
+                                    'target_name': target_name,
+                                    'object_id': obj_id,
+                                    'object_name': obj_name
+                                })
+                        
+                    except Exception as e:
+                        print(f"      ⚠️ Error checking {obj_name}: {e}")
+                        continue
+                
+                if looking_at_objects:
+                    frame_analysis['target_overlaps'][target_id] = looking_at_objects
+            
+        except Exception as e:
+            print(f"  ⚠️ Error in analyze_frame_overlaps: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        return frame_analysis
+
+    def track_frame_overlaps_batch(self, frame_idx, frame_results, object_names):
+        """Track 'looking at' events with ACCURATE offset detection"""
+        try:
+            frame_analysis = self.analyze_frame_overlaps(frame_results, object_names)
+            
+            # Store frame analysis for video creation
+            if not hasattr(self, 'frame_analyses'):
+                self.frame_analyses = {}
+            self.frame_analyses[frame_idx] = frame_analysis
+            
+            # Process each target to update events with accurate timing
+            for target_id in self.target_objects:
+                current_overlaps = []
+                
+                # Get current overlaps for this target
+                if target_id in frame_analysis.get('target_overlaps', {}):
+                    looking_at_objects = frame_analysis['target_overlaps'][target_id]
+                    current_overlaps = [obj['object_name'] for obj in looking_at_objects]
+                
+                # Update events with accurate offset detection
+                self._update_overlap_event(target_id, frame_idx, current_overlaps)
+            
+            return frame_analysis
+            
+        except Exception as e:
+            print(f"  ⚠️ Error in track_frame_overlaps_batch for frame {frame_idx}: {e}")
+            return {
+                'target_overlaps': {},
+                'object_relationships': {},
+                'looking_at_events': []
+            }
+
+    
+    def _update_overlap_event(self, target_id, frame_idx, overlapping_names):
+        """Enhanced event tracking with stricter continuation criteria"""
+        events = self.overlap_events[target_id]
+        current_overlap_set = set(overlapping_names)
+        target_name = self.target_objects[target_id]
+        
+        # Check if we have an ongoing event
+        if events and events[-1].get('end_frame') is None:
+            last_event = events[-1]
+            last_overlap_set = set(last_event['overlapping_objects'])
+            
+            if current_overlap_set == last_overlap_set and current_overlap_set:
+                # Same objects detected - but is the overlap still STRONG enough to continue?
+                # We need to check the overlap strength, not just presence
+                
+                # Get the frame results to check overlap strength
+                # (This would need to be passed from the calling function)
+                # For now, continue the event but add validation
+                
+                last_event['duration_frames'] = frame_idx - last_event['start_frame'] + 1
+                print(f"      → Continuing event: {target_name} frames {last_event['start_frame']}-{frame_idx}")
+                
+            else:
+                # Objects changed or stopped - END the event
+                last_event['end_frame'] = frame_idx - 1
+                last_event['duration_frames'] = last_event['end_frame'] - last_event['start_frame'] + 1
+                
+                objects_str = ', '.join(last_event['overlapping_objects'])
+                print(f"      ✅ Event ended: {target_name} frames {last_event['start_frame']}-{last_event['end_frame']} ({last_event['duration_frames']} frames) | {objects_str}")
+                
+                # Start new event if we have new overlaps
+                if current_overlap_set:
+                    new_event = {
+                        'start_frame': frame_idx,
+                        'end_frame': None,
+                        'duration_frames': 1,
+                        'overlapping_objects': list(overlapping_names),
+                        'event_type': 'looking_at'
+                    }
+                    events.append(new_event)
+                    objects_str = ', '.join(current_overlap_set)
+                    print(f"      🎯 New event started: {target_name} frame {frame_idx} | {objects_str}")
+        else:
+            # No ongoing event - start new one if we have overlaps
+            if current_overlap_set:
+                new_event = {
+                    'start_frame': frame_idx,
+                    'end_frame': None,
+                    'duration_frames': 1,
+                    'overlapping_objects': list(overlapping_names),
+                    'event_type': 'looking_at'
+                }
+                events.append(new_event)
+                objects_str = ', '.join(current_overlap_set)
+                print(f"      🎯 First event started: {target_name} frame {frame_idx} | {objects_str}")
+
     def has_targets(self):
         """Check if any targets are registered"""
         return bool(self.target_objects)
@@ -432,7 +580,7 @@ class UltraOptimizedProcessor:
         if not self.frame_names:
             raise ValueError("No frames found in the specified directory!")
         
-        print(f"Ultra-Optimized Processor with Enhanced Overlap Detection")
+        print(f"Processor with Overlap Detection")
         print(f"  Frames: {len(self.frame_names)}")
         print(f"  Reference frame: {reference_frame}")
         print(f"  Overlap threshold: {overlap_threshold*100:.1f}%")
@@ -449,7 +597,7 @@ class UltraOptimizedProcessor:
         try:
             configure_torch_ultra_conservative()
             
-            print(f"\nStarting ultra-optimized processing with enhanced overlap detection...")
+            print(f"\nStarting processing with overlap detection...")
             
             # Try processing with fallback strategies
             for attempt in range(3):
@@ -485,11 +633,11 @@ class UltraOptimizedProcessor:
             return None
         finally:
             ultra_cleanup_memory()
-    
+
     def _process_standard_optimized(self, points_dict, labels_dict, object_names, debug):
         """Standard optimized processing with enhanced overlap detection"""
         # Initialize SAM2 state
-        print("🔧 Initializing ultra-optimized SAM2 state...")
+        print("🔧 Initializing SAM2 state...")
         inference_state = self.predictor.init_state(
             video_path=self.video_dir,
             offload_video_to_cpu=self.offload_video_to_cpu,
@@ -644,7 +792,7 @@ class UltraOptimizedProcessor:
         return None
     
     def save_results_video_with_enhanced_annotations(self, results, output_path, fps=30, show_original=True, alpha=0.5):
-        """Save results video with enhanced overlap annotations"""
+        """Save results video with enhanced visual feedback for looking-at events"""
         if not results:
             print("No results to save!")
             return
@@ -665,7 +813,7 @@ class UltraOptimizedProcessor:
         # Color map for consistent colors
         cmap = plt.get_cmap("tab10")
         
-        print("💾 Saving video with enhanced overlap annotations...")
+        print("💾 Saving video with enhanced looking-at visual feedback...")
         overlap_frame_count = 0
         
         for frame_idx in tqdm(range(len(self.frame_names)), desc="Saving frames"):
@@ -680,14 +828,41 @@ class UltraOptimizedProcessor:
             if hasattr(self, 'frame_analyses') and frame_idx in self.frame_analyses:
                 frame_analysis = self.frame_analyses[frame_idx]
             
-            # Check if this frame has overlaps
-            has_overlaps = (frame_analysis and 
-                          frame_analysis.get('target_overlaps') and 
-                          any(frame_analysis['target_overlaps'].values()))
-            if has_overlaps:
+            # Check if this frame has looking-at events
+            has_looking_at_events = (frame_analysis and 
+                                frame_analysis.get('target_overlaps') and 
+                                any(frame_analysis['target_overlaps'].values()))
+            if has_looking_at_events:
                 overlap_frame_count += 1
             
-            # Apply masks and enhanced annotations
+            # Collect all looking-at information for this frame
+            looking_at_info = {}  # obj_id -> {is_target: bool, looking_at: [objects], looked_at_by: [targets]}
+            
+            if frame_analysis:
+                # Initialize info for all objects
+                for obj_id in results.get(frame_idx, {}):
+                    looking_at_info[obj_id] = {
+                        'is_target': False,
+                        'looking_at': [],
+                        'looked_at_by': [],
+                        'is_being_looked_at': False
+                    }
+                
+                # Process target overlaps
+                for target_id, looking_at_objects in frame_analysis.get('target_overlaps', {}).items():
+                    if target_id in looking_at_info:
+                        looking_at_info[target_id]['is_target'] = True
+                        looking_at_info[target_id]['looking_at'] = [obj['object_name'] for obj in looking_at_objects]
+                    
+                    # Mark objects being looked at
+                    for obj_info in looking_at_objects:
+                        obj_id = obj_info['object_id']
+                        if obj_id in looking_at_info:
+                            target_name = self.overlap_tracker.target_objects.get(target_id, f"Target_{target_id}")
+                            looking_at_info[obj_id]['looked_at_by'].append(target_name)
+                            looking_at_info[obj_id]['is_being_looked_at'] = True
+            
+            # Apply masks with enhanced visual feedback
             if frame_idx in results:
                 for obj_id, mask in results[frame_idx].items():
                     if len(mask.shape) == 3:
@@ -702,22 +877,27 @@ class UltraOptimizedProcessor:
                             continue
                     
                     if mask.shape == (height, width):
-                        # Get enhanced annotation info
-                        annotation_info = None
-                        is_overlapping = False
+                        obj_info = looking_at_info.get(obj_id, {})
+                        is_target = obj_info.get('is_target', False)
+                        is_being_looked_at = obj_info.get('is_being_looked_at', False)
+                        looking_at = obj_info.get('looking_at', [])
+                        looked_at_by = obj_info.get('looked_at_by', [])
                         
-                        if frame_analysis and obj_id in frame_analysis.get('object_relationships', {}):
-                            annotation_info = frame_analysis['object_relationships'][obj_id]
-                            is_overlapping = len(annotation_info.get('overlapping_with', [])) > 0 or 'related_to_target' in annotation_info
-                        
-                        # Choose color based on 'looking at' event status
+                        # Choose colors based on status
                         base_color = np.array(cmap(obj_id % 10)[:3]) * 255
-                        if is_looking_at:
-                            # Enhanced highlighting for objects in 'looking at' events
-                            color = np.minimum(base_color + [120, 0, 0], 255)
-                            border_color = (0, 0, 255)  # Red border
-                            border_thickness = 6
+                        
+                        if is_target and looking_at:
+                            # Target that's looking at something - bright highlight
+                            color = np.minimum(base_color + [100, 100, 0], 255)  # Yellow tint for active targets
+                            border_color = (0, 255, 255)  # Cyan border for active targets
+                            border_thickness = 8
+                        elif is_being_looked_at:
+                            # Object being looked at - red highlight
+                            color = np.minimum(base_color + [120, 0, 0], 255)  # Red tint
+                            border_color = (0, 0, 255)  # RED BORDER for looked-at objects
+                            border_thickness = 8
                         else:
+                            # Normal object
                             color = base_color
                             border_color = None
                             border_thickness = 2
@@ -735,103 +915,101 @@ class UltraOptimizedProcessor:
                             cv2.addWeighted(overlay, 1.0 - alpha, color_mask, alpha, 0, blend_mask)
                             overlay[mask] = blend_mask[mask]
                         
-                        # Add enhanced border
+                        # Add enhanced border for special objects
                         if border_color:
                             contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                             cv2.drawContours(overlay, contours, -1, border_color, border_thickness)
                         
-                        # Add enhanced object label
+                        # Add object label with status
                         moments = cv2.moments(mask.astype(np.uint8))
                         if moments['m00'] != 0:
                             cx = int(moments['m10'] / moments['m00'])
                             cy = int(moments['m01'] / moments['m00'])
                             
-                            # Use enhanced annotation if available
-                            if annotation_info:
-                                label = annotation_info['display_text']
+                            obj_name = self.object_names.get(obj_id, f"Object_{obj_id}")
+                            
+                            # Create status label
+                            if is_target and looking_at:
+                                if len(looking_at) == 1:
+                                    label = f"🎯{obj_name} → LOOKING AT {looking_at[0]}"
+                                else:
+                                    label = f"🎯{obj_name} → LOOKING AT {len(looking_at)} OBJECTS"
+                            elif is_being_looked_at:
+                                if len(looked_at_by) == 1:
+                                    label = f"{obj_name} ← LOOKED AT BY {looked_at_by[0]}"
+                                else:
+                                    label = f"{obj_name} ← LOOKED AT BY {len(looked_at_by)} TARGETS"
                             else:
-                                obj_name = self.object_names.get(obj_id, f"Object_{obj_id}")
-                                if obj_id in self.overlap_tracker.target_objects:
-                                    label = f"TARGET {obj_name}"
+                                if is_target:
+                                    label = f"🎯{obj_name}"
                                 else:
                                     label = obj_name
                             
-                            # Enhanced text rendering
-                            font_scale = 0.5 if len(label) > 30 else 0.6
+                            # Enhanced text rendering based on status
+                            font_scale = 0.6 if len(label) > 30 else 0.7
                             text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 2)[0]
                             
-                            # Calculate text position (avoid going off screen)
+                            # Calculate text position
                             label_x = max(5, min(cx - text_size[0]//2, width - text_size[0] - 5))
                             label_y = max(25, min(cy + 20, height - 10))
                             
-                            # Enhanced background for objects in events
-                            if is_looking_at:
-                                bg_color = (0, 0, 150)  # Darker blue background
+                            # Enhanced background and text colors
+                            if is_target and looking_at:
+                                bg_color = (0, 100, 200)  # Orange background for active targets
                                 text_color = (0, 255, 255)  # Bright cyan text
-                                padding = 8
+                                padding = 10
+                            elif is_being_looked_at:
+                                bg_color = (0, 0, 200)  # Red background for looked-at objects
+                                text_color = (255, 255, 255)  # White text
+                                padding = 10
                             else:
-                                bg_color = (0, 0, 0)
-                                text_color = (255, 255, 255)
+                                bg_color = (0, 0, 0)  # Black background
+                                text_color = (255, 255, 255)  # White text
                                 padding = 5
                             
-                            # Multi-line text handling for long labels
-                            if len(label) > 40:
-                                # Split long labels into multiple lines
-                                words = label.split(' ')
-                                lines = []
-                                current_line = []
-                                
-                                for word in words:
-                                    test_line = ' '.join(current_line + [word])
-                                    test_size = cv2.getTextSize(test_line, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 2)[0]
-                                    
-                                    if test_size[0] > width - 20:  # Leave some margin
-                                        if current_line:
-                                            lines.append(' '.join(current_line))
-                                            current_line = [word]
-                                        else:
-                                            lines.append(word)
-                                    else:
-                                        current_line.append(word)
-                                
-                                if current_line:
-                                    lines.append(' '.join(current_line))
-                                
-                                # Draw multi-line text
-                                line_height = 22
-                                total_height = len(lines) * line_height
-                                
-                                # Background rectangle for all lines
-                                max_width = max(cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 2)[0][0] for line in lines)
-                                cv2.rectangle(overlay, 
-                                            (label_x - padding, label_y - 20), 
-                                            (label_x + max_width + padding, label_y + total_height - 15), 
-                                            bg_color, -1)
-                                
-                                # Draw each line
-                                for i, line in enumerate(lines):
-                                    line_y = label_y + (i * line_height)
-                                    cv2.putText(overlay, line, (label_x, line_y),
-                                               cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color, 2)
-                            else:
-                                # Single line text
-                                cv2.rectangle(overlay, 
-                                            (label_x - padding, label_y - 20), 
-                                            (label_x + text_size[0] + padding, label_y + 5), 
-                                            bg_color, -1)
-                                
-                                cv2.putText(overlay, label, (label_x, label_y),
-                                           cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color, 2)
+                            # Draw background rectangle
+                            cv2.rectangle(overlay, 
+                                        (label_x - padding, label_y - 25), 
+                                        (label_x + text_size[0] + padding, label_y + 5), 
+                                        bg_color, -1)
+                            
+                            # Draw text
+                            cv2.putText(overlay, label, (label_x, label_y),
+                                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color, 2)
             
-            # Add simplified frame info and event status
-            info_text = f"Frame {frame_idx}/{len(self.frame_names)-1}"
-            if has_overlaps:
-                info_text += " - LOOKING AT EVENT DETECTED"
-                # Prominent background for event frames
-                cv2.rectangle(overlay, (5, 5), (len(info_text) * 12, 45), (0, 0, 180), -1)
-                cv2.putText(overlay, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-            else:
-                cv2.putText(overlay, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            # Add prominent frame status display
+            status_messages = []
+            
+            if has_looking_at_events:
+                # Collect all looking-at events for display
+                target_events = []
+                if frame_analysis:
+                    for target_id, looking_at_objects in frame_analysis.get('target_overlaps', {}).items():
+                        target_name = self.overlap_tracker.target_objects.get(target_id, f"Target_{target_id}")
+                        object_names = [obj['object_name'] for obj in looking_at_objects]
+                        
+                        if len(object_names) == 1:
+                            target_events.append(f"{target_name} → {object_names[0]}")
+                        else:
+                            target_events.append(f"{target_name} → {len(object_names)} objects")
+                
+                status_messages = [f"🎯 LOOKING AT DETECTED: {'; '.join(target_events)}"]
+            
+            # Draw status messages
+            info_y = 30
+            for i, message in enumerate(status_messages):
+                if has_looking_at_events:
+                    # Prominent background for looking-at events
+                    text_size = cv2.getTextSize(message, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+                    cv2.rectangle(overlay, (5, info_y - 25), (text_size[0] + 15, info_y + 10), (0, 0, 180), -1)
+                    cv2.putText(overlay, message, (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                else:
+                    cv2.putText(overlay, message, (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                info_y += 35
+            
+            # Add frame counter
+            frame_info = f"Frame {frame_idx}/{len(self.frame_names)-1}"
+            cv2.putText(overlay, frame_info, (10, height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
             
             # Create output frame
             if show_original:
@@ -842,42 +1020,67 @@ class UltraOptimizedProcessor:
             out.write(output_frame)
         
         out.release()
-        print(f"✅ Video saved with 'looking at' event annotations: {output_path}")
-        print(f"📊 'Looking at' events detected in {overlap_frame_count} frames")
+        print(f"✅ Video saved with enhanced looking-at visual feedback: {output_path}")
+        print(f"🎯 Looking-at events detected in {overlap_frame_count} frames")
+        print(f"📊 Visual enhancements:")
+        print(f"  • RED BORDERS on objects being looked at")
+        print(f"  • CYAN BORDERS on targets that are looking")
+        print(f"  • Clear status text for each object")
+        print(f"  • Prominent event announcements")
         
-        # Print simplified analysis summary
-        if hasattr(self, 'frame_analyses'):
-            total_events = sum(len(frame_analysis.get('looking_at_events', [])) 
-                             for frame_analysis in self.frame_analyses.values())
-            
-            print(f"📈 Analysis Summary:")
-            print(f"  • Total 'looking at' events detected: {total_events}")
-            print(f"  • Frames with events: {overlap_frame_count}")
-            print(f"  • Clean begin/end timing captured for ELAN export")
-    
-    def create_elan_file(self, video_path, output_path, fps):
-        """Create ELAN file with enhanced overlap information"""
+    def create_elan_file(self, video_path, output_path, fps, frame_offset=0):
+        """Create ELAN file with corrected timing alignment"""
         if not self.overlap_tracker.has_targets():
             print("No targets found - skipping ELAN export")
             return
         
-        print(f"Creating enhanced ELAN file: {output_path}")
+        print(f"Creating ELAN file with timing correction: {output_path}")
+        print(f"  Video FPS: {fps}")
+        print(f"  Frame offset: {frame_offset}")
+        
+        # Get actual video properties for verification
+        try:
+            import cv2
+            cap = cv2.VideoCapture(video_path)
+            actual_fps = cap.get(cv2.CAP_PROP_FPS)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            duration_seconds = total_frames / actual_fps
+            cap.release()
+            
+            print(f"  Actual video FPS: {actual_fps}")
+            print(f"  Video duration: {duration_seconds:.2f}s ({total_frames} frames)")
+            
+            # Use actual FPS if significantly different
+            if abs(fps - actual_fps) > 1.0:
+                print(f"  ⚠️ FPS mismatch detected! Using actual FPS: {actual_fps}")
+                fps = actual_fps
+        except:
+            print(f"  Using provided FPS: {fps}")
         
         summary = self.overlap_tracker.get_overlap_summary()
         
-        # Create ELAN XML with simplified 'looking at' events
+        # Debug timing calculations
+        print(f"\n🔍 Timing Debug:")
+        for target_name, target_data in summary.items():
+            if target_data['events']:
+                first_event = target_data['events'][0]
+                start_frame = first_event['start_frame'] + frame_offset
+                start_time = start_frame / fps
+                print(f"  {target_name} first event: frame {first_event['start_frame']} → {start_frame} → {start_time:.3f}s")
+        
+        # Create ELAN XML with corrected timing
         header = f'''<?xml version="1.0" encoding="UTF-8"?>
-<ANNOTATION_DOCUMENT AUTHOR="SAM2_Looking_At_Events" DATE="{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}" FORMAT="3.0" VERSION="3.0"
-    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.mpi.nl/tools/elan/EAFv3.0.xsd">
-    <HEADER MEDIA_FILE="" TIME_UNITS="milliseconds">
-        <MEDIA_DESCRIPTOR MEDIA_URL="file://{os.path.abspath(video_path)}"
-            MIME_TYPE="video/mp4" RELATIVE_MEDIA_URL="{os.path.basename(video_path)}"/>
-        <PROPERTY NAME="lastUsedAnnotationId">0</PROPERTY>
-    </HEADER>
-    <TIME_ORDER>
-'''
+    <ANNOTATION_DOCUMENT AUTHOR="SAM2_Looking_At_Events" DATE="{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}" FORMAT="3.0" VERSION="3.0"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.mpi.nl/tools/elan/EAFv3.0.xsd">
+        <HEADER MEDIA_FILE="" TIME_UNITS="milliseconds">
+            <MEDIA_DESCRIPTOR MEDIA_URL="file://{os.path.abspath(video_path)}"
+                MIME_TYPE="video/mp4" RELATIVE_MEDIA_URL="{os.path.basename(video_path)}"/>
+            <PROPERTY NAME="lastUsedAnnotationId">0</PROPERTY>
+        </HEADER>
+        <TIME_ORDER>
+    '''
 
-        # Create time slots
+        # Create time slots with corrected timing
         time_slots = []
         time_slot_id = 1
         time_slot_refs = {}
@@ -885,8 +1088,13 @@ class UltraOptimizedProcessor:
         all_time_points = set()
         for target_name, target_data in summary.items():
             for event in target_data['events']:
-                start_time = event['start_frame'] / fps
-                end_time = event['end_frame'] / fps
+                # Apply frame offset and convert to time
+                start_frame_corrected = event['start_frame'] + frame_offset
+                end_frame_corrected = event['end_frame'] + frame_offset
+                
+                start_time = start_frame_corrected / fps
+                end_time = end_frame_corrected / fps
+                
                 all_time_points.add(start_time)
                 all_time_points.add(end_time)
         
@@ -898,32 +1106,41 @@ class UltraOptimizedProcessor:
 
         header += '\n'.join(time_slots) + '\n    </TIME_ORDER>\n'
 
-        # Create enhanced tiers
+        # Create tiers with corrected timing
         tier_content = ""
         annotation_id = 1
         
         for target_name, target_data in summary.items():
-            tier_id = target_name.upper().replace(' ', '_')
-            tier_content += f'    <TIER DEFAULT_LOCALE="en" LINGUISTIC_TYPE_REF="default" TIER_ID="{tier_id}">\n'
+            tier_id = target_name.upper().replace(' ', '_').replace('-', '_')
+            tier_content += f'    <TIER DEFAULT_LOCALE="en" LINGUISTIC_TYPE_REF="default" TIER_ID="{tier_id}_LOOKING_AT">\n'
             
             for event in target_data['events']:
-                start_time = event['start_frame'] / fps
-                end_time = event['end_frame'] / fps
+                # Apply frame offset and convert to time
+                start_frame_corrected = event['start_frame'] + frame_offset
+                end_frame_corrected = event['end_frame'] + frame_offset
+                
+                start_time = start_frame_corrected / fps
+                end_time = end_frame_corrected / fps
                 start_ms = int(start_time * 1000)
                 end_ms = int(end_time * 1000)
                 
                 start_slot = time_slot_refs[start_ms]
                 end_slot = time_slot_refs[end_ms]
                 
-                # Simplified annotation for 'looking at' events
+                # Create annotation
                 overlapping_objects_str = ", ".join(event['overlapping_objects'])
-                annotation_value = f"Looking at: {overlapping_objects_str}"
+                duration_seconds = end_time - start_time
+                
+                if len(event['overlapping_objects']) == 1:
+                    annotation_value = f"Looking at: {overlapping_objects_str}"
+                else:
+                    annotation_value = f"Looking at {len(event['overlapping_objects'])} objects: {overlapping_objects_str}"
                 
                 annotation = f'''        <ANNOTATION>
-            <ALIGNABLE_ANNOTATION ANNOTATION_ID="a{annotation_id}" TIME_SLOT_REF1="{start_slot}" TIME_SLOT_REF2="{end_slot}">
-                <ANNOTATION_VALUE>{annotation_value}</ANNOTATION_VALUE>
-            </ALIGNABLE_ANNOTATION>
-        </ANNOTATION>'''
+                <ALIGNABLE_ANNOTATION ANNOTATION_ID="a{annotation_id}" TIME_SLOT_REF1="{start_slot}" TIME_SLOT_REF2="{end_slot}">
+                    <ANNOTATION_VALUE>{annotation_value}</ANNOTATION_VALUE>
+                </ALIGNABLE_ANNOTATION>
+            </ANNOTATION>'''
                 
                 tier_content += annotation + '\n'
                 annotation_id += 1
@@ -931,17 +1148,35 @@ class UltraOptimizedProcessor:
             tier_content += '    </TIER>\n'
 
         footer = '''    <LINGUISTIC_TYPE GRAPHIC_REFERENCES="false" LINGUISTIC_TYPE_ID="default" TIME_ALIGNABLE="true"/>
-    <LOCALE LANGUAGE_CODE="en"/>
-    <CONSTRAINT DESCRIPTION="Time subdivision of parent annotation's time interval, no time gaps allowed within this interval" STEREOTYPE="Time_Subdivision"/>
-    <CONSTRAINT DESCRIPTION="Symbolic subdivision of a parent annotation. Annotations cannot be time-aligned" STEREOTYPE="Symbolic_Subdivision"/>
-    <CONSTRAINT DESCRIPTION="1-1 association with a parent annotation" STEREOTYPE="Symbolic_Association"/>
-    <CONSTRAINT DESCRIPTION="Time alignable annotations within the parent annotation's time interval, gaps are allowed" STEREOTYPE="Included_In"/>
-</ANNOTATION_DOCUMENT>'''
+        <LOCALE LANGUAGE_CODE="en"/>
+        <CONSTRAINT DESCRIPTION="Time subdivision of parent annotation's time interval, no time gaps allowed within this interval" STEREOTYPE="Time_Subdivision"/>
+        <CONSTRAINT DESCRIPTION="Symbolic subdivision of a parent annotation. Annotations cannot be time-aligned" STEREOTYPE="Symbolic_Subdivision"/>
+        <CONSTRAINT DESCRIPTION="1-1 association with a parent annotation" STEREOTYPE="Symbolic_Association"/>
+        <CONSTRAINT DESCRIPTION="Time alignable annotations within the parent annotation's time interval, gaps are allowed" STEREOTYPE="Included_In"/>
+    </ANNOTATION_DOCUMENT>'''
 
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write(header + tier_content + footer)
         
-        print(f"✅ ELAN file created with 'looking at' events: {output_path}")
+        print(f"✅ ELAN file created with timing correction: {output_path}")
+        
+        # Print timing verification
+        print(f"\n📄 Timing Verification:")
+        for target_name, target_data in summary.items():
+            if target_data['events']:
+                print(f"  🎯 {target_name}:")
+                for i, event in enumerate(target_data['events'][:3]):
+                    start_frame_corrected = event['start_frame'] + frame_offset
+                    end_frame_corrected = event['end_frame'] + frame_offset
+                    start_time = start_frame_corrected / fps
+                    end_time = end_frame_corrected / fps
+                    
+                    objects = ", ".join(event['overlapping_objects'])
+                    print(f"    Event {i+1}: {start_time:.3f}s - {end_time:.3f}s | {objects}")
+                    print(f"              (frames {start_frame_corrected} - {end_frame_corrected})")
+                
+                if len(target_data['events']) > 3:
+                    print(f"    ... and {len(target_data['events'])-3} more events")
 
 # Point selection function (same as before but with enhanced tips)
 def select_points_opencv(frame, processor=None):
@@ -965,7 +1200,116 @@ def select_points_opencv(frame, processor=None):
         cv2.putText(img, display_name, 
                    (int(point[0] + 5), int(point[1] - 5)),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-    
+        
+    def test_current_mask(frame, points_dict, labels_dict, current_obj_id, object_names, predictor):
+        """Test current mask by generating preview with SAM2"""
+        if current_obj_id not in points_dict or len(points_dict[current_obj_id]) == 0:
+            print("No points selected for current object!")
+            return
+        
+        try:
+            print(f"Testing mask for object {current_obj_id}...")
+            
+            # Create a temporary frames directory for testing
+            import tempfile
+            temp_dir = tempfile.mkdtemp()
+            temp_frame_path = os.path.join(temp_dir, "00000.jpg")
+            cv2.imwrite(temp_frame_path, frame)
+            
+            print(f"Created temp frame: {temp_frame_path}")
+            
+            # Initialize SAM2 state for testing (same as in main processing)
+            inference_state = predictor.init_state(
+                video_path=temp_dir,
+                offload_video_to_cpu=True,
+                offload_state_to_cpu=True,
+                async_loading_frames=True,
+            )
+            
+            predictor.reset_state(inference_state)
+            print("SAM2 state initialized for testing")
+            
+            # Add points for current object (same as in main processing)
+            points = np.array(points_dict[current_obj_id], dtype=np.float32)
+            labels = np.array(labels_dict[current_obj_id], dtype=np.int32)
+            
+            print(f"Points shape: {points.shape}, Labels shape: {labels.shape}")
+            print(f"Points: {points}")
+            print(f"Labels: {labels}")
+            
+            _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
+                inference_state=inference_state,
+                frame_idx=0,
+                obj_id=current_obj_id,
+                points=points,
+                labels=labels,
+            )
+            
+            print(f"SAM2 output - obj_ids: {out_obj_ids}, mask_logits shape: {out_mask_logits.shape}")
+            
+            # Generate mask (same as in main processing)
+            mask = (out_mask_logits[0] > 0.0).cpu().numpy()
+            if len(mask.shape) == 3:
+                mask = mask[0]
+            
+            print(f"Generated mask shape: {mask.shape}, mask sum: {np.sum(mask)}")
+            
+            if np.sum(mask) == 0:
+                print("⚠️ Warning: Generated mask is empty!")
+                
+            # Create preview
+            preview = frame.copy()
+            
+            # Apply mask with color (same as in main processing)
+            cmap = plt.get_cmap("tab10")
+            color = np.array(cmap(current_obj_id % 10)[:3]) * 255
+            
+            # Create colored overlay
+            color_mask = np.zeros_like(preview)
+            for c in range(3):
+                color_mask[:, :, c][mask] = color[c]
+            
+            # Blend overlay
+            cv2.addWeighted(preview, 0.5, color_mask, 0.5, 0, preview)
+            
+            # Add contours for better visibility
+            contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(preview, contours, -1, (0, 255, 0), 3)
+            
+            # Add text info
+            obj_name = object_names.get(current_obj_id, f"Object_{current_obj_id}")
+            pos_count = sum(1 for l in labels if l == 1)
+            neg_count = sum(1 for l in labels if l == 0)
+            
+            info_text = f"MASK TEST: {obj_name} (+{pos_count} -{neg_count} points)"
+            cv2.putText(preview, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            cv2.putText(preview, f"Mask pixels: {np.sum(mask)}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            cv2.putText(preview, "Press any key to continue...", (10, preview.shape[0] - 20), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            
+            # Show preview
+            cv2.namedWindow('Mask Test Preview', cv2.WINDOW_NORMAL)
+            cv2.imshow('Mask Test Preview', preview)
+            cv2.waitKey(0)
+            cv2.destroyWindow('Mask Test Preview')
+            
+            # Cleanup
+            predictor.reset_state(inference_state)
+            shutil.rmtree(temp_dir)
+            
+            print(f"✅ Mask test completed for {obj_name}")
+            
+        except Exception as e:
+            print(f"❌ Error testing mask: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Cleanup on error
+            try:
+                predictor.reset_state(inference_state)
+                shutil.rmtree(temp_dir)
+            except:
+                pass
     def redraw_all_points():
         display = frame.copy()
         for obj_id in points_dict:
@@ -985,6 +1329,7 @@ def select_points_opencv(frame, processor=None):
             "Left Click: Add positive point (+)",
             "Right Click: Add negative point (-)",
             "R: Reset  N: Next  P: Previous",
+            "T: Test current mask  R: Reset  N: Next  P: Previous",  
             "C: Name object  Enter: Finish  Q: Quit",
             "",
             "OVERLAP TIPS:",
@@ -1086,7 +1431,12 @@ def select_points_opencv(frame, processor=None):
                 img_display = redraw_all_points()
                 obj_name = get_object_name(current_obj_id)
                 print(f"Reset points for {obj_name}")
-        
+        elif key == ord('t'):  # ADD THIS
+            if processor and processor.predictor:
+                test_current_mask(frame, points_dict, labels_dict, current_obj_id, object_names, processor.predictor)
+            else:
+                messagebox.showwarning("Test Mask", "Predictor not available for testing!")
+    
         elif key == ord('n'):
             current_obj_id += 1
             obj_name = get_object_name(current_obj_id)
@@ -1117,7 +1467,7 @@ def select_points_opencv(frame, processor=None):
 class VideoAnalysisApp:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("SAM2 Video Analysis - 'Looking At' Event Detection")
+        self.root.title("SAM2 Video Analysis - 'Looking At' Event Detection \n Developers: Wim Pouw, Davide Ahmar, Babajide Owoyele")
         self.root.geometry("750x850")
         self.root.minsize(750, 850)
         
@@ -1592,7 +1942,6 @@ def main():
     print("  • SPATIAL RELATIONSHIP DETECTION: Any overlap/inclusion = 'looking at' event")
     print("  • CLEAN VIDEO SIGNALING: Clear indicators when events are happening")
     print("  • ACCURATE TIMING: Precise begin/end times for ELAN behavioral analysis")
-    print("  • SIMPLIFIED ANNOTATIONS: Focus on event detection, not complex percentages")
     print()
     print("🎯 EVENT TYPES:")
     print("  • All spatial relationships treated as 'looking at' events")
@@ -1612,7 +1961,7 @@ def main():
     print("  • Perfect for gaze analysis and interaction studies")
     print()
     print("🧠 MEMORY OPTIMIZATIONS:")
-    print("  • Ultra-conservative GPU memory management")
+    print("  • GPU memory management")
     print("  • Multiple fallback strategies for OOM recovery")
     print("  • Enhanced cleanup every 25 frames")
     print("  • Automatic CPU fallback if needed")
