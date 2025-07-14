@@ -1,54 +1,119 @@
 import os
-from moviepy.editor import VideoFileClip
+import subprocess
+import json
 from pathlib import Path
+
+def get_video_info(video_path):
+    """
+    Get video resolution using ffprobe
+    """
+    try:
+        cmd = [
+            'ffprobe', 
+            '-v', 'quiet',
+            '-print_format', 'json',
+            '-show_streams',
+            video_path
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        data = json.loads(result.stdout)
+        
+        # Find video stream
+        for stream in data['streams']:
+            if stream['codec_type'] == 'video':
+                width = int(stream['width'])
+                height = int(stream['height'])
+                return width, height
+        
+        return None, None
+    except Exception as e:
+        print(f"Error getting video info: {e}")
+        return None, None
 
 def resize_video(input_path, output_path):
     """
-    Resize a video to half its original resolution
+    Resize a video to half its original resolution using ffmpeg
     """
     try:
-        # Load the video
-        video = VideoFileClip(input_path)
+        # Get original resolution
+        original_width, original_height = get_video_info(input_path)
         
-        # Get current resolution
-        original_width, original_height = video.size
+        if original_width is None or original_height is None:
+            print(f"❌ Could not get video info for: {os.path.basename(input_path)}")
+            return False
+        
         print(f"Original resolution: {original_width}x{original_height}")
         
         # Calculate new resolution (half of original)
         new_width = original_width // 2
         new_height = original_height // 2
+        
+        # Make sure dimensions are even (required by some codecs)
+        new_width = new_width if new_width % 2 == 0 else new_width - 1
+        new_height = new_height if new_height % 2 == 0 else new_height - 1
+        
         print(f"New resolution: {new_width}x{new_height}")
         
-        # Resize the video
-        resized_video = video.resize((new_width, new_height))
+        # Build ffmpeg command
+        cmd = [
+            'ffmpeg',
+            '-i', input_path,
+            '-vf', f'scale={new_width}:{new_height}',
+            '-c:v', 'libx264',
+            '-crf', '23',  # Good quality-to-size ratio
+            '-c:a', 'aac',
+            '-b:a', '128k',
+            '-y',  # Overwrite output file if exists
+            output_path
+        ]
         
-        # Write the resized video
-        resized_video.write_videofile(
-            output_path,
-            codec='libx264',
-            audio_codec='aac',
-            verbose=False,
-            logger=None
+        # Run ffmpeg with minimal output
+        result = subprocess.run(
+            cmd, 
+            capture_output=True, 
+            text=True,
+            check=True
         )
-        
-        # Clean up
-        video.close()
-        resized_video.close()
         
         print(f"✅ Successfully resized: {os.path.basename(input_path)}")
         return True
         
+    except subprocess.CalledProcessError as e:
+        print(f"❌ FFmpeg error processing {os.path.basename(input_path)}: {e}")
+        return False
     except Exception as e:
         print(f"❌ Error processing {os.path.basename(input_path)}: {str(e)}")
+        return False
+
+def check_ffmpeg():
+    """
+    Check if ffmpeg is installed and available
+    """
+    try:
+        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+        subprocess.run(['ffprobe', '-version'], capture_output=True, check=True)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
         return False
 
 def process_videos():
     """
     Process all videos in a user-specified folder and resize them to half resolution
     """
-    # Ask user for folder path
-    print("=== Video Resolution Reducer ===")
+    print("=== Video Resolution Reducer (FFmpeg) ===")
     print("This script will resize all videos in a folder to half their original resolution.")
+    print()
+    
+    # Check if ffmpeg is available
+    if not check_ffmpeg():
+        print("❌ FFmpeg is not installed or not found in PATH.")
+        print("Please install FFmpeg from https://ffmpeg.org/")
+        print("Make sure both 'ffmpeg' and 'ffprobe' are in your system PATH.")
+        input("\nPress Enter to exit...")
+        return
+    
+    print("✅ FFmpeg found and ready to use!")
     print()
     
     while True:
@@ -71,7 +136,7 @@ def process_videos():
             print()
     
     # Common video file extensions
-    video_extensions = {'.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v'}
+    video_extensions = {'.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v', '.mts', '.m2ts'}
     
     # Find all video files
     video_files = []
